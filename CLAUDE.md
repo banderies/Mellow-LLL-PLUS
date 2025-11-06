@@ -1,0 +1,130 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+This is firmware for the Mellow Fly LLL (Long Link Line) buffer board, a filament buffer system for 3D printers. The device manages filament feeding and detection using a TMC2209 stepper driver and multiple sensors.
+
+**Target Hardware:** STM32F072C8T6 microcontroller (Cortex-M0, 48MHz, 64KB flash, 16KB RAM)
+
+## Build System
+
+**Platform:** PlatformIO with Arduino framework
+
+### Build Commands
+
+```bash
+# Build the project
+pio run
+
+# Build and upload via DFU (requires device in DFU mode)
+pio run --target upload
+
+# Clean build files
+pio run --target clean
+
+# Open serial monitor (115200 baud)
+pio device monitor
+```
+
+### Upload Methods
+- Primary: DFU (Device Firmware Update) mode
+- Alternatives: ST-Link, J-Link, Black Magic Probe, serial bootloader
+
+## Project Structure
+
+```
+src/main.cpp              # Entry point, calls buffer_init() and buffer_loop()
+lib/buffer/               # Core buffer management logic
+  buffer.h                # Pin definitions, constants, data structures
+  buffer.cpp              # Main control loop and sensor/motor logic
+boards/                   # Custom board definition
+variants/F072C8/          # Hardware-specific pin mappings
+klipper/                  # Klipper configuration files for integration
+```
+
+## Core Architecture
+
+The firmware operates as a state machine controlling filament buffer position:
+
+### Sensor System
+- **3 Hall Effect Sensors** (HALL1/2/3 on PB2/3/4): Detect filament position in buffer
+  - Position 1 (HALL3): Trigger forward feed
+  - Position 2 (HALL2): Stop motor
+  - Position 3 (HALL1): Trigger reverse feed
+- **Filament Switch** (PB7): Material present/absent detection
+- **2 Manual Buttons** (KEY1/KEY2 on PB13/12): Manual forward/reverse control
+
+### Motor Control
+- TMC2209 stepper driver with UART control (9600 baud on PB1)
+- Speed control via VACTUAL register (default 260 RPM)
+- 64 microsteps per step
+- Software-controlled enable/direction/step pins
+
+### Optional MDM Module
+If connected, adds blockage detection by comparing:
+- Expected pulse count from controller (via TIM2)
+- Actual movement pulses from MDM encoder
+- Triggers blockage alarm when error exceeds threshold
+
+### Safety Features
+- Independent watchdog timer (IWDG) with 2s timeout
+- Timeout detection for continuous feeding (default 60s)
+- Blockage detection with configurable error tolerance
+- EEPROM storage for persistent configuration
+
+## Serial Commands
+
+Connect via USB serial at 115200 baud:
+
+```
+timeout <ms>         # Set forward feed timeout (default 60000ms)
+rt                   # Read current timeout value
+steps <value>        # Set steps per mm (default 916)
+encoder <value>      # Set MDM encoder length in mm/pulse (default 1.73)
+scale <value>        # Set blockage error scale factor (default 2)
+speed <rpm>          # Set motor speed in RPM (default 260)
+info                 # Display all current parameters
+clear                # Reset blockage detection counters
+```
+
+## Pin Mapping Reference
+
+Critical pins defined in `lib/buffer/buffer.h`:
+- Motor: EN=PA6, DIR=PA7, STEP=PC13, UART=PB1
+- Indicators: ERR_LED=PA15, START_LED=PA8, DUANLIAO(断料)=PB15, DULIAO(堵料)=PB15
+- Extension pins: PA2/3/4/5, PB10/11/14 (used for blockage detection interface)
+- Signal control: FRONT_SIGNAL_PIN=PB5, BACK_SIGNAL_PIN=PB6 (external control inputs)
+
+## Klipper Integration
+
+The `klipper/` directory contains configuration files for integrating this buffer with Klipper firmware. Key features:
+- Filament runout sensor configuration
+- Manual load/retract macros
+- Configurable extrusion parameters (temperature, length, speed)
+
+To use: Include the appropriate .cfg file in your printer.cfg and adjust pin assignments to match your mainboard connections.
+
+## Development Notes
+
+### Interrupt Priority
+The firmware uses multiple interrupt sources with specific priorities (set in `buffer_init()`):
+- Priority 0: TIM6 (timeout + watchdog)
+- Priority 1: EXTI4_15 (buttons, direction signal, MDM pulses)
+
+### State Machine Flow
+1. Read all sensor states
+2. Determine motor action based on buffer position
+3. Check for timeout/error conditions
+4. Update motor state only when changed (prevents redundant UART traffic)
+5. Process serial commands
+
+### TMC2209 Communication
+Communication failures are handled with automatic retries (up to 9 attempts). The IFCNT register is monitored to verify command transmission.
+
+### Important Variables
+- `is_error`: Global error flag that stops motor
+- `is_front`: Tracks forward movement for timeout monitoring
+- `motor_state`: Current motor state (Forward/Stop/Back)
+- `blockage_detect`: Structure holding blockage detection data
