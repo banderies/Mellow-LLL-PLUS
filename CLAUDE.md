@@ -4,9 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is firmware for the Mellow Fly LLL (Long Link Line) buffer board, a filament buffer system for 3D printers. The device manages filament feeding and detection using a TMC2209 stepper driver and multiple sensors.
+This is a custom fork of the Mellow Fly LLL (Long Link Line) buffer board firmware, for a filament buffer system on a VZ330 3D printer. The device manages filament feeding and detection using a TMC2209 stepper driver and multiple sensors.
 
 **Target Hardware:** STM32F072C8T6 microcontroller (Cortex-M0, 48MHz, 64KB flash, 16KB RAM)
+
+## Git / Fork Structure
+
+This repo is a fork of `Fly3DTeam/Buffer` (the official Mellow firmware).
+
+- **`origin`** (`banderies/Mellow-LLL-PLUS`) — our GitHub repo
+- **`upstream`** (`Fly3DTeam/Buffer`) — Mellow's official repo (read-only reference)
+- **Branch `custom`** — our working branch with all customizations
+- **Branch `dev_v1.1.0`** — tracks upstream `dev-1.1.x` (most active upstream branch)
+
+To check for upstream changes: `git fetch upstream && git log HEAD..upstream/dev-1.1.x --oneline`
+
+### Custom Modifications (vs upstream)
+- **Distal filament switch** on PB14: detects filament parked in extruder gears during unload
+- See `docs/STATUS.md` for full pin analysis and behavior documentation
 
 ## Build System
 
@@ -53,7 +68,8 @@ The firmware operates as a state machine controlling filament buffer position:
   - Position 1 (HALL3): Trigger forward feed
   - Position 2 (HALL2): Stop motor
   - Position 3 (HALL1): Trigger reverse feed
-- **Filament Switch** (PB7): Material present/absent detection
+- **Proximal Filament Switch** (PB7): Material present/absent detection (buffer side of extruder gears)
+- **Distal Filament Switch** (PB14, custom): Detects filament on hotend side of extruder gears
 - **2 Manual Buttons** (KEY1/KEY2 on PB13/12): Manual forward/reverse control
 
 ### Motor Control
@@ -85,7 +101,9 @@ steps <value>        # Set steps per mm (default 916)
 encoder <value>      # Set MDM encoder length in mm/pulse (default 1.73)
 scale <value>        # Set blockage error scale factor (default 2)
 speed <rpm>          # Set motor speed in RPM (default 260)
-info                 # Display all current parameters
+I <mA>               # Set motor current in mA (0-3000, default 500)
+out <0|1>            # Set DUANLIAO output polarity (filament absent signal)
+info                 # Display all current parameters + switch states
 clear                # Reset blockage detection counters
 ```
 
@@ -94,7 +112,8 @@ clear                # Reset blockage detection counters
 Critical pins defined in `lib/buffer/buffer.h`:
 - Motor: EN=PA6, DIR=PA7, STEP=PC13, UART=PB1
 - Indicators: ERR_LED=PA15, START_LED=PA8, DUANLIAO(断料)=PB15, DULIAO(堵料)=PB15
-- Extension pins: PA2/3/4/5, PB10/11/14 (used for blockage detection interface)
+- Extension pins: PA2/3/4/5, PB10/11 (used for blockage detection interface)
+- Distal switch: PB14 (custom — filament detection on hotend side of extruder gears)
 - Signal control: FRONT_SIGNAL_PIN=PB5, BACK_SIGNAL_PIN=PB6 (external control inputs)
 
 ## Klipper Integration
@@ -114,11 +133,15 @@ The firmware uses multiple interrupt sources with specific priorities (set in `b
 - Priority 1: EXTI4_15 (buttons, direction signal, MDM pulses)
 
 ### State Machine Flow
-1. Read all sensor states
-2. Determine motor action based on buffer position
-3. Check for timeout/error conditions
-4. Update motor state only when changed (prevents redundant UART traffic)
-5. Process serial commands
+1. Read all sensor states (including distal switch on PB14)
+2. Check filament presence via proximal + distal switches:
+   - Both absent → no filament, stop motor, signal DUANLIAO
+   - Proximal present + distal absent → filament parked in gears, stop motor, signal DUANLIAO
+   - Both present → filament loaded, continue to buffer position logic
+3. Determine motor action based on buffer position (hall sensors)
+4. Check for timeout/error conditions
+5. Update motor state only when changed (prevents redundant UART traffic)
+6. Process serial commands
 
 ### TMC2209 Communication
 Communication failures are handled with automatic retries (up to 9 attempts). The IFCNT register is monitored to verify command transmission.

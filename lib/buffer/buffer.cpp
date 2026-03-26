@@ -264,6 +264,7 @@ void buffer_sensor_init(){
   pinMode(HALL2,INPUT);
   pinMode(HALL3,INPUT);
   pinMode(ENDSTOP_3,INPUT);
+  pinMode(DISTAL_SWITCH,INPUT_PULLUP); // distal filament switch on PB14; HIGH=absent, LOW=present
 
 //   attachInterrupt(HALL1,&Buffer_S3_IT_Callback,RISING);
 //   attachInterrupt(HALL2,&Buffer_S2_IT_Callback,RISING);
@@ -327,7 +328,8 @@ void read_sensor_state(void)
 	buffer.buffer1_pos1_sensor_state= digitalRead(HALL3);
 	buffer.buffer1_pos2_sensor_state= digitalRead(HALL2);	
 	buffer.buffer1_pos3_sensor_state= digitalRead(HALL1);		
-	buffer.buffer1_material_swtich_state=digitalRead(ENDSTOP_3);	
+	buffer.buffer1_material_swtich_state=digitalRead(ENDSTOP_3);
+	buffer.distal_switch_state=digitalRead(DISTAL_SWITCH);
 	buffer.key1=digitalRead(KEY1);
 	buffer.key2=digitalRead(KEY2);
 }
@@ -436,17 +438,20 @@ void motor_control(void)
 		WRITE_EN_PIN(1);
 	}
 	
+	bool proximal_absent = digitalRead(ENDSTOP_3);        // HIGH = no filament at proximal (buffer side)
+	bool distal_absent = buffer.distal_switch_state;      // HIGH = no filament at distal (hotend side)
+
 	if(connet_mdm_flag){//连接了MDM断堵料模块
 		//判断耗材
-		if(digitalRead(ENDSTOP_3)&&!digitalRead(MDM_DPIN))
+		if(proximal_absent&&!digitalRead(MDM_DPIN))
 		{
 			//无耗材，停止电机
 			driver.VACTUAL(STOP);	//停止
 			motor_state=Stop;
-			
+
 			//断料引脚输出断料状态
 			digitalWrite(DUANLIAO,DUANLIAO_OUT_STATE);
-			
+
 			//关闭指示灯
 			digitalWrite(START_LED,0);
 
@@ -455,30 +460,50 @@ void motor_control(void)
 			is_error=false;
 			WRITE_EN_PIN(1);
 
-			
+
 			return;//无耗材，结束
+		}
+		else if(!proximal_absent && distal_absent)
+		{
+			// Filament parked in extruder gears: proximal triggered but distal clear.
+			// Stop buffer motor — filament tip is captured in gears, ready for next load.
+			driver.VACTUAL(STOP);
+			motor_state=Stop;
+			last_motor_state=Stop;
+
+			// Signal filament absent to controller so automated unload completes
+			digitalWrite(DUANLIAO,DUANLIAO_OUT_STATE);
+
+			digitalWrite(START_LED,0);
+
+			is_front=false;
+			front_time=0;
+			is_error=false;
+			WRITE_EN_PIN(1);
+
+			return;
 		}
 		else if(!blockage_detect.blockage_flag){
 			//有耗材，断料引脚输出非断料状态
 			digitalWrite(DUANLIAO,!DUANLIAO_OUT_STATE);
-			
+
 			//开启指示灯
-			digitalWrite(START_LED,1);					
+			digitalWrite(START_LED,1);
 
 		}
 
 	}
 	else{
 		//判断耗材
-		if(digitalRead(ENDSTOP_3))
+		if(proximal_absent)
 		{
 			//无耗材，停止电机
 			driver.VACTUAL(STOP);	//停止
 			motor_state=Stop;
-			
-			//断料引脚输出低电平
+
+			//断料引脚输出断料状态
 			digitalWrite(DUANLIAO,DUANLIAO_OUT_STATE);
-			
+
 			//关闭指示灯
 			digitalWrite(START_LED,0);
 
@@ -487,15 +512,36 @@ void motor_control(void)
 			is_error=false;
 			WRITE_EN_PIN(1);
 
-			
+
 			return;//无耗材，结束
-		}		
+		}
+
+		if(distal_absent)
+		{
+			// Filament parked in extruder gears: proximal triggered but distal clear.
+			// Stop buffer motor — filament tip is captured in gears, ready for next load.
+			driver.VACTUAL(STOP);
+			motor_state=Stop;
+			last_motor_state=Stop;
+
+			// Signal filament absent to controller so automated unload completes
+			digitalWrite(DUANLIAO,DUANLIAO_OUT_STATE);
+
+			digitalWrite(START_LED,0);
+
+			is_front=false;
+			front_time=0;
+			is_error=false;
+			WRITE_EN_PIN(1);
+
+			return;
+		}
 
 		//有耗材，断料引脚输出非断料状态
 		digitalWrite(DUANLIAO,!DUANLIAO_OUT_STATE);
-		
+
 		//开启指示灯
-		digitalWrite(START_LED,1);		
+		digitalWrite(START_LED,1);
 	}
 
 		
@@ -824,9 +870,14 @@ void USB_Serial_Analys(void){
 				Serial.println("encoder_length="+String(encoder_length));
 				Serial.println("timeout="+String(timeout));
 				Serial.println("steps="+String(steps));
+				Serial.println("speed="+String(SPEED));
 				Serial.println("allow_error_scale="+String(allow_error_scale));
 				Serial.println("allow_error="+String(blockage_detect.allow_error));
 				Serial.println("DUANLIAO_OUT_STATE="+String(buffer_para.DUANLIAO_OUT_STATE));
+				Serial.print("proximal_switch(PB7)=");
+				Serial.println(digitalRead(ENDSTOP_3) ? "OPEN (no filament)" : "CLOSED (filament present)");
+				Serial.print("distal_switch(PB14)=");
+				Serial.println(digitalRead(DISTAL_SWITCH) ? "OPEN (no filament)" : "CLOSED (filament present)");
 			}			
 			else if(strstr(serial_buf.c_str(),"scale")){
 				int index=serial_buf.indexOf(" ");

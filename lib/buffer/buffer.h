@@ -35,7 +35,8 @@
 #define HALL2       PB3 //光感2   
 #define HALL3       PB4 //光感1
 
-#define ENDSTOP_3   PB7 //耗材开关
+#define ENDSTOP_3   PB7 //耗材开关 (proximal, buffer side of extruder gears)
+#define DISTAL_SWITCH PB14 //远端开关 (distal, hotend side of extruder gears)
 
 #define KEY1        PB13 //后退
 #define KEY2        PB12 //前进
@@ -107,7 +108,8 @@ typedef struct Buffer
 	bool buffer1_pos1_sensor_state;	
 	bool buffer1_pos2_sensor_state;		
 	bool buffer1_pos3_sensor_state;		
-	bool buffer1_material_swtich_state;	
+	bool buffer1_material_swtich_state;
+	bool distal_switch_state;
 	bool key1;
 	bool key2;
 	
