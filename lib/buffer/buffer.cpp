@@ -26,6 +26,7 @@
 
 
 #include "buffer.h"
+#define VERSION "1.1.5"
 
 //GPIO输入
 #define SIGNAL_COUNT_READ_DIR_IO()	(SIGNAL_COUNT_DIR_GPIO_Port -> IDR & SIGNAL_COUNT_DIR_Pin)
@@ -47,7 +48,7 @@ bool is_front=false;//前进标志位
 uint32_t front_time=0;//前进时间
 const uint32_t DEFAULT_TIMEOUT = 60000;
 uint32_t timeout=60000;//超时时间，单位：ms;
-bool is_error=true;//错误标志位，如果连续60s推送耗材没停过，则认为错误
+bool is_error=false;//错误标志位，如果连续60s推送耗材没停过，则认为错误
 String serial_buf;
 
 static HardwareTimer timer(TIM6);//超时出错
@@ -909,7 +910,10 @@ void USB_Serial_Analys(void){
 				serial_buf="";
 				Serial.print("set DUANLIAO_OUT_STATE  succeed! DUANLIAO_OUT_STATE=");
 				Serial.println(DUANLIAO_OUT_STATE);
-			}		
+			}
+			else if(strstr(serial_buf.c_str(),"version")){
+				Serial.println("version: "+String(VERSION));
+			}
 
 
 
@@ -925,8 +929,9 @@ void USB_Serial_Analys(void){
 				Serial.print("|     show all info : <info CRLF>             |\n");
 				Serial.print("|     set scale: <scale nnn CRLF>             |\n");
 				Serial.print("|     set speed(r/min): <speed nnn CRLF>      |\n");
-				// Serial.print("|     set I_CURRENT(mA): <I nnn CRLF>          |\n");
+				Serial.print("|     set I_CURRENT(mA): <I nnn CRLF>         |\n");
 				Serial.print("|     endstop out: <out n>                    |\n");
+				Serial.print("|     View version information: <version CRLF>|\n");
 				Serial.print("+-----------------------------------------------+\n\n");
 			}
 			serial_buf="";
