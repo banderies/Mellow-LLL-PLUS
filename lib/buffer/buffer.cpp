@@ -435,14 +435,17 @@ void motor_control(void)
 
 		if(proximal && distal) {
 			if(last_saved_state == SAVED_STATE_PRIMED) {
-				// Previously Primed, both switches match — trust it, no probe needed
+				// Previously Primed — trust it, no motor movement
 				device_state = DS_Primed;
+			} else if(last_saved_state == SAVED_STATE_LOADED) {
+				// Previously Loaded — resume buffer operation (hall sensors manage slack)
+				// Safe: not advancing new filament, just resuming buffer management
+				device_state = DS_Loaded;
 			} else if(buffer.buffer1_pos1_sensor_state) {
-				// Buffer already fully retracted — go to Primed (user presses forward to resume Loaded)
-				// Never auto-enter Loaded on startup to avoid unexpected motor movement
+				// Unknown state but buffer is retracted — default to Primed (safe, motor off)
 				device_state = DS_Primed;
 			} else {
-				// Unknown or previously Loaded — retract to verify
+				// Unknown state, buffer not retracted — probe to determine
 				device_state = DS_StartupProbe;
 			}
 		} else if(proximal && !distal) {
@@ -676,82 +679,52 @@ void motor_control(void)
 			break;
 
 		case DS_Loaded: {
-			// Normal buffer operation (stock hall sensor logic)
+			// === BUFFER ACTIVE ===
+			// Motor is 100% driven by hall sensors (matches upstream logic).
+			// Only exits: back button press, proximal opens (filament runout), or forward timeout.
 			digitalWrite(DUANLIAO, !DUANLIAO_OUT_STATE);
 			digitalWrite(START_LED, 1);
 
-			// If motor is actively running (loading in progress), any button = halt
-			if(motor_state != Stop && (fwd_press || back_press)) {
+			// Back button → exit buffer active, start retract sequence
+			if(back_press) {
 				cmd_motor_stop();
 				is_front = false;
 				front_time = 0;
-				is_error = false;
-				device_state = DS_Primed;
-				break;
-			}
-
-			// Motor stopped (buffer stable, filament at hotend)
-			// Back → start retract-and-reprime sequence
-			if(back_press) {
-				cmd_motor_back();
-				is_front = false;
-				front_time = 0;
-				is_error = false; // Clear any pending timeout from Loaded forward operation
 				transition_start = millis();
 				device_state = DS_Retracting;
 				break;
 			}
 
-			// Sensor validation: filament runout
+			// Filament runout (proximal opened) → emergency stop
 			if(!proximal) {
 				cmd_motor_stop();
 				is_front = false;
 				front_time = 0;
-				digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
-				digitalWrite(START_LED, 0);
 				device_state = DS_Empty;
 				break;
 			}
 
-			// Sensor validation: distal opened (extruder retracted past gears)
-			if(!distal) {
-				cmd_motor_stop();
-				is_front = false;
-				front_time = 0;
-				// Re-prime: advance until distal triggers
-				cmd_motor_forward();
-				front_time = 0;
-				transition_start = millis();
-				device_state = DS_Repriming;
-				break;
-			}
-
-			// Hall sensor buffer position logic
-			Motor_State new_state = motor_state;
+			// Hall sensor buffer logic (upstream behavior):
+			// - Sensor active → change motor state + send command only on change
+			// - No sensor active → motor continues in current direction (no default-to-stop)
 			if(buffer.buffer1_pos1_sensor_state) {
-				new_state = Forward;
 				is_front = true;
+				if(motor_state != Forward) cmd_motor_forward();
 			} else if(buffer.buffer1_pos2_sensor_state) {
-				new_state = Stop;
 				is_front = false;
 				front_time = 0;
+				if(motor_state != Stop) cmd_motor_stop();
 			} else if(buffer.buffer1_pos3_sensor_state) {
-				new_state = Back;
 				is_front = false;
 				front_time = 0;
+				if(motor_state != Back) cmd_motor_back();
 			}
-
-			if(new_state != motor_state) {
-				switch(new_state) {
-					case Forward: cmd_motor_forward(); break;
-					case Stop:    cmd_motor_stop();    break;
-					case Back:    cmd_motor_back();     break;
-				}
-			}
+			// If no sensor active: motor continues in current direction
 			break;
 		}
 
 		case DS_Retracting:
+			if(motor_state != Back) cmd_motor_back();
 			is_front = false;
 			front_time = 0;
 			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
