@@ -395,17 +395,24 @@ static void cmd_motor_back() {
 	last_motor_state = Back;
 }
 
-static void cmd_motor_stop() {
-	// Send stop command with retry to ensure TMC2209 receives it
+// Soft stop: VACTUAL=0 but EN stays LOW (coils stay energized with hold current).
+// Use for hall sensor buffer cycling to avoid audible click from EN toggling.
+static void cmd_motor_coast() {
 	uint8_t cnt = driver.IFCNT();
 	driver.VACTUAL(STOP);
 	uint8_t retries = 3;
 	while(cnt == driver.IFCNT() && retries--) {
 		driver.VACTUAL(STOP);
 	}
-	WRITE_EN_PIN(1); // Disable driver via EN pin (hardware kill, works even if UART fails)
 	motor_state = Stop;
 	last_motor_state = Stop;
+}
+
+// Full stop: VACTUAL=0 and EN HIGH (coils de-energized).
+// Use for state transitions, errors, and safety shutdowns.
+static void cmd_motor_stop() {
+	cmd_motor_coast();
+	WRITE_EN_PIN(1); // Disable driver via EN pin (hardware kill, works even if UART fails)
 }
 
 /**
@@ -707,16 +714,26 @@ void motor_control(void)
 			// Hall sensor buffer logic (upstream behavior):
 			// - Sensor active → change motor state + send command only on change
 			// - No sensor active → motor continues in current direction (no default-to-stop)
+			// Coast-stop at pos2 keeps EN LOW for smooth restarts; after 1s idle, disable EN.
+			static uint32_t coast_since = 0;
 			if(buffer.buffer1_pos1_sensor_state) {
 				is_front = true;
+				coast_since = 0;
 				if(motor_state != Forward) cmd_motor_forward();
 			} else if(buffer.buffer1_pos2_sensor_state) {
 				is_front = false;
 				front_time = 0;
-				if(motor_state != Stop) cmd_motor_stop();
+				if(motor_state != Stop) {
+					cmd_motor_coast();
+					coast_since = millis();
+				} else if(coast_since && millis() - coast_since >= 1000) {
+					WRITE_EN_PIN(1); // Settled — fully de-energize
+					coast_since = 0;
+				}
 			} else if(buffer.buffer1_pos3_sensor_state) {
 				is_front = false;
 				front_time = 0;
+				coast_since = 0;
 				if(motor_state != Back) cmd_motor_back();
 			}
 			// If no sensor active: motor continues in current direction
