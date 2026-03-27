@@ -92,8 +92,8 @@ static const char* state_name(DeviceState s) {
 	}
 }
 
-// Persisted device state in EEPROM (address 32, after Buffer_Parameter struct)
-const int EEPROM_ADDR_DEVICE_STATE = 32;
+// Persisted device state in EEPROM (after Buffer_Parameter struct, sizeof=36)
+const int EEPROM_ADDR_DEVICE_STATE = 40;
 const uint8_t SAVED_STATE_UNKNOWN = 0;
 const uint8_t SAVED_STATE_PRIMED = 1;
 const uint8_t SAVED_STATE_LOADED = 2;
