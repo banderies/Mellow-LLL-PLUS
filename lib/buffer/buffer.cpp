@@ -670,12 +670,12 @@ void motor_control(void)
 			digitalWrite(START_LED, 0);
 
 			// Sensor validation: react to switch changes
-			// (skip distal check for 500ms after entering to avoid switch bounce)
+			// (skip distal check briefly after entering to avoid switch bounce)
 			if(!proximal) {
 				device_state = DS_Empty;
 				break;
 			}
-			if(!distal && millis() - state_entry_time >= 500) {
+			if(!distal && millis() - state_entry_time >= 50) {
 				cmd_motor_forward();
 				front_time = 0;
 				transition_start = millis();
