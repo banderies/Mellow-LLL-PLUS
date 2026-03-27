@@ -10,7 +10,5 @@ void setup() {
 
 void loop() {
     buffer_loop();
-    // Serial.println("loop() is running");
-    // delay(1000);
 }
 

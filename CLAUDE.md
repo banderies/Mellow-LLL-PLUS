@@ -113,7 +113,7 @@ clear                # Reset blockage detection counters
 
 Critical pins defined in `lib/buffer/buffer.h`:
 - Motor: EN=PA6, DIR=PA7, STEP=PC13, UART=PB1
-- Indicators: ERR_LED=PA15, START_LED=PA8, DUANLIAO(断料)=PB15, DULIAO(堵料)=PB15
+- Indicators: ERR_LED=PA15, START_LED=PA8, DUANLIAO(filament runout)=PB15, DULIAO(blockage)=PB15
 - Extension pins: PA2/3/4/5, PB10/11 (used for blockage detection interface)
 - Distal switch: PB14 (custom — filament detection on hotend side of extruder gears)
 - Signal control: FRONT_SIGNAL_PIN=PB5, BACK_SIGNAL_PIN=PB6 (external control inputs)
