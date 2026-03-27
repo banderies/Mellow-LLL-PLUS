@@ -54,8 +54,6 @@ TIM_HandleTypeDef htim2;//hardware timer for pulse reception
 
 bool key1_press_flag=false;
 bool key2_press_flag=false;
-uint32_t key1_press_times=0;
-uint32_t key2_press_times=0;
 
 // Device state machine
 typedef enum {
@@ -68,8 +66,6 @@ typedef enum {
 	DS_Unloading,        // Backing out from Primed to Empty
 	DS_Halted,           // Motor stopped, waiting for button input
 	DS_StartupProbe,     // Retracting on boot to determine Primed vs Loaded
-	DS_DeadmanForward,   // Override: motor forward while held
-	DS_DeadmanBack       // Override: motor backward while held
 } DeviceState;
 
 static DeviceState device_state = DS_Empty;
@@ -85,8 +81,6 @@ static const char* state_name(DeviceState s) {
 		case DS_Unloading: return "Unloading";
 		case DS_Halted: return "Halted";
 		case DS_StartupProbe: return "StartupProbe";
-		case DS_DeadmanForward: return "DeadmanFwd";
-		case DS_DeadmanBack: return "DeadmanBack";
 		default: return "Unknown";
 	}
 }
@@ -409,7 +403,7 @@ static void cmd_motor_stop() {
   *
   * Buttons (KEY1=back, KEY2=forward):
   *   Short press: state transition (or halt if in transition)
-  *   Hold 2s: deadman switch (motor runs while held)
+  *   Short press: state transition (or halt if in transition)
   *
   * @param  NULL
   * @retval NULL
@@ -449,78 +443,20 @@ void motor_control(void)
 		}
 	}
 
-	// --- Button edge detection (press = falling edge, release = rising edge) ---
+	// --- Button edge detection (press = falling edge) ---
 	static bool key1_prev = false, key2_prev = false;
-	bool key1_held = key1_press_flag;
-	bool key2_held = key2_press_flag;
-	bool key1_just_pressed = key1_held && !key1_prev;
-	bool key2_just_pressed = key2_held && !key2_prev;
-	bool key1_just_released = !key1_held && key1_prev;
-	bool key2_just_released = !key2_held && key2_prev;
-	key1_prev = key1_held;
-	key2_prev = key2_held;
+	bool key1_just_pressed = key1_press_flag && !key1_prev;
+	bool key2_just_pressed = key2_press_flag && !key2_prev;
+	key1_prev = key1_press_flag;
+	key2_prev = key2_press_flag;
 
 	// Track if a press was consumed during a transition (prevents release from triggering a new transition)
 	static bool key1_consumed = false, key2_consumed = false;
-	if(key1_just_released) key1_consumed = false;
-	if(key2_just_released) key2_consumed = false;
-
-	// --- Deadman switch detection (2s hold, only one at a time) ---
-	// Capture state at press time (before back_press/fwd_press transitions fire),
-	// so deadman has the correct pre-press state even though the initial press edge
-	// may have already triggered a state transition.
-	static DeviceState state_at_press = DS_Empty;
-	static DeviceState pre_deadman_state = DS_Empty;
-	if(key1_just_pressed || key2_just_pressed) {
-		state_at_press = device_state;
-	}
-	if(device_state != DS_DeadmanBack && device_state != DS_DeadmanForward &&
-	   key1_held && !key2_held && millis() - key1_press_times >= 2000) {
-		pre_deadman_state = state_at_press;
-		cmd_motor_back();
-		is_front = false;
-		key1_consumed = true;
-		device_state = DS_DeadmanBack;
-	}
-	if(device_state != DS_DeadmanForward && device_state != DS_DeadmanBack &&
-	   key2_held && !key1_held && millis() - key2_press_times >= 2000) {
-		pre_deadman_state = state_at_press;
-		cmd_motor_forward();
-		is_front = false;
-		key2_consumed = true;
-		device_state = DS_DeadmanForward;
-	}
-
-	// Handle deadman release → determine state from sensors
-	// Only restore pre-deadman state for Loaded (indistinguishable from Primed by sensors alone)
-	if(device_state == DS_DeadmanBack && key1_just_released) {
-		cmd_motor_stop();
-		is_front = false;
-		front_time = 0;
-		if(!proximal && !distal)                                device_state = DS_Empty;
-		else if(proximal && distal && pre_deadman_state == DS_Loaded) device_state = DS_Loaded;
-		else if(proximal && distal)                             device_state = DS_Primed;
-		else                                                    device_state = DS_Halted;
-		return;
-	}
-	if(device_state == DS_DeadmanForward && key2_just_released) {
-		cmd_motor_stop();
-		is_front = false;
-		front_time = 0;
-		if(!proximal && !distal)                                device_state = DS_Empty;
-		else if(proximal && distal && pre_deadman_state == DS_Loaded) device_state = DS_Loaded;
-		else if(proximal && distal)                             device_state = DS_Primed;
-		else                                                    device_state = DS_Halted;
-		return;
-	}
-
-	// Deadman active: keep motor running, skip state machine
-	if(device_state == DS_DeadmanBack || device_state == DS_DeadmanForward) {
-		return;
-	}
+	if(!key1_press_flag) key1_consumed = false;
+	if(!key2_press_flag) key2_consumed = false;
 
 	// --- Button press events (on press, not release) ---
-	// Only fire if not already consumed and cooldown elapsed (prevents multi-state jumps from mashing)
+	// Cooldown prevents multi-state jumps from button mashing
 	static uint32_t last_button_action = 0;
 	const uint32_t BUTTON_COOLDOWN = 300; // ms between accepted button events
 	uint32_t now = millis();
@@ -529,7 +465,7 @@ void motor_control(void)
 	bool fwd_press = key2_just_pressed && !key2_consumed && cooled;
 	if(back_press || fwd_press) last_button_action = now;
 
-	// --- PB5/PB6 external signal control (blocking deadman) ---
+	// --- PB5/PB6 external signal control (blocking, motor runs while pin LOW) ---
 	if(digitalRead(BACK_SIGNAL_PIN) == LOW) {
 		cmd_motor_back();
 		while(digitalRead(BACK_SIGNAL_PIN) == LOW) { delay(1); g_run_cnt++; }
@@ -553,9 +489,7 @@ void motor_control(void)
 	// If both switches open, force to Empty regardless of state.
 	// Catches edge cases where rapid filament removal leaves device in inconsistent state.
 	if(!proximal && !distal &&
-	   device_state != DS_Empty &&
-	   device_state != DS_DeadmanForward &&
-	   device_state != DS_DeadmanBack) {
+	   device_state != DS_Empty) {
 		cmd_motor_stop(); // Always force stop (EN pin HIGH), even if motor_state thinks it's stopped
 		is_front = false;
 		front_time = 0;
@@ -999,7 +933,6 @@ void key1_it_callback(void){
 	last_edge = now;
 
 	if(!digitalRead(KEY1)){  // Falling edge (press)
-		key1_press_times=now;
 		key1_press_flag=true;
 	}
 	else{  // Rising edge (release)
@@ -1014,7 +947,6 @@ void key2_it_callback(void){
 	last_edge = now;
 
 	if(!digitalRead(KEY2)){  // Falling edge (press)
-		key2_press_times=now;
 		key2_press_flag=true;
 	}
 	else{  // Rising edge (release)
