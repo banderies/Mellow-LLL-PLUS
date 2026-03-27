@@ -148,6 +148,7 @@ struct Buffer_Parameter{
 	int32_t SPEED;
 	uint32_t I_CURRENT;
 	bool DUANLIAO_OUT_STATE;
+	uint32_t coast_delay;
 	uint16_t magic_number;
 };
 

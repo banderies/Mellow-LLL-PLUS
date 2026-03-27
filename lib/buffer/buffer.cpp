@@ -115,6 +115,9 @@ float allow_error_scale=2;//allowed error scale factor
 
 uint32_t I_CURRENT = 500;		//motor current (mA)
 
+const uint32_t DEFAULT_COAST_DELAY = 500;
+uint32_t coast_delay = 500;	//ms to keep coils energized after buffer stop
+
 const int EEPROM_ADDR_TIMEOUT = 0;
 const int EEPROM_ADDR_STEPS = 4;
 const int EEPROM_ADDR_ENCODER_LENGTH = 8;
@@ -170,7 +173,7 @@ void Signal_Dir_Init(void);
 void buffer_parameter_init(Buffer_Parameter &buffer_para){
 	EEPROM.get(0, buffer_para);
 	if(buffer_para.magic_number!=0x55AA){
-		buffer_para=Buffer_Parameter{DEFAULT_TIMEOUT,DEFAULT_STEPS,DEFAULT_ENCODER_LENGTH,DEFAULT_ALLOW_ERROR_SCALE,260,I_CURRENT,DUANLIAO_OUT_STATE,0x55AA};
+		buffer_para=Buffer_Parameter{DEFAULT_TIMEOUT,DEFAULT_STEPS,DEFAULT_ENCODER_LENGTH,DEFAULT_ALLOW_ERROR_SCALE,260,I_CURRENT,DUANLIAO_OUT_STATE,DEFAULT_COAST_DELAY,0x55AA};
 		EEPROM.put(0, buffer_para);
 	}
 	timeout=buffer_para.timeout;
@@ -180,6 +183,7 @@ void buffer_parameter_init(Buffer_Parameter &buffer_para){
 	SPEED=buffer_para.SPEED;
 	I_CURRENT=buffer_para.I_CURRENT;
 	DUANLIAO_OUT_STATE=buffer_para.DUANLIAO_OUT_STATE;
+	coast_delay=buffer_para.coast_delay;
 }
 
 void buffer_init(){
@@ -346,7 +350,8 @@ void buffer_motor_init(){
   driver.VACTUAL(STOP);           // Set velocity
   driver.en_spreadCycle(true);
   driver.pwm_autoscale(true);
- 
+
+  digitalWrite(EN_PIN, HIGH);     // Disable driver until state machine needs it
 }
 
 /**
@@ -479,8 +484,11 @@ void motor_control(void)
 	if(key2_just_released) key2_consumed = false;
 
 	// --- Deadman switch detection (2s hold, only one at a time) ---
+	// Save pre-deadman state so we can restore it on release
+	static DeviceState pre_deadman_state = DS_Empty;
 	if(device_state != DS_DeadmanBack && device_state != DS_DeadmanForward &&
 	   key1_held && !key2_held && millis() - key1_press_times >= 2000) {
+		pre_deadman_state = device_state;
 		cmd_motor_back();
 		is_front = false;
 		key1_consumed = true;
@@ -488,20 +496,20 @@ void motor_control(void)
 	}
 	if(device_state != DS_DeadmanForward && device_state != DS_DeadmanBack &&
 	   key2_held && !key1_held && millis() - key2_press_times >= 2000) {
+		pre_deadman_state = device_state;
 		cmd_motor_forward();
 		is_front = false;
 		key2_consumed = true;
 		device_state = DS_DeadmanForward;
 	}
 
-	// Handle deadman release → determine state from sensors
+	// Handle deadman release → restore pre-deadman state, overridden by sensor reality
 	if(device_state == DS_DeadmanBack && key1_just_released) {
 		cmd_motor_stop();
 		is_front = false;
 		front_time = 0;
-		// Match state to sensor reality
 		if(!proximal && !distal)      device_state = DS_Empty;
-		else if(proximal && distal)   device_state = DS_Primed;
+		else if(proximal && distal)   device_state = pre_deadman_state;
 		else                          device_state = DS_Halted;
 		return;
 	}
@@ -509,9 +517,8 @@ void motor_control(void)
 		cmd_motor_stop();
 		is_front = false;
 		front_time = 0;
-		// Match state to sensor reality
 		if(!proximal && !distal)      device_state = DS_Empty;
-		else if(proximal && distal)   device_state = DS_Primed;
+		else if(proximal && distal)   device_state = pre_deadman_state;
 		else                          device_state = DS_Halted;
 		return;
 	}
@@ -714,7 +721,6 @@ void motor_control(void)
 			// Hall sensor buffer logic (upstream behavior):
 			// - Sensor active → change motor state + send command only on change
 			// - No sensor active → motor continues in current direction (no default-to-stop)
-			// Coast-stop at pos2 keeps EN LOW for smooth restarts; after 1s idle, disable EN.
 			static uint32_t coast_since = 0;
 			if(buffer.buffer1_pos1_sensor_state) {
 				is_front = true;
@@ -726,9 +732,6 @@ void motor_control(void)
 				if(motor_state != Stop) {
 					cmd_motor_coast();
 					coast_since = millis();
-				} else if(coast_since && millis() - coast_since >= 1000) {
-					WRITE_EN_PIN(1); // Settled — fully de-energize
-					coast_since = 0;
 				}
 			} else if(buffer.buffer1_pos3_sensor_state) {
 				is_front = false;
@@ -736,7 +739,13 @@ void motor_control(void)
 				coast_since = 0;
 				if(motor_state != Back) cmd_motor_back();
 			}
-			// If no sensor active: motor continues in current direction
+
+			// Delayed EN disable: keep coils energized for smooth restarts,
+			// then fully de-energize after settling (works in dead zones too)
+			if(motor_state == Stop && coast_since && millis() - coast_since >= coast_delay) {
+				WRITE_EN_PIN(1);
+				coast_since = 0;
+			}
 			break;
 		}
 
@@ -1188,6 +1197,7 @@ void USB_Serial_Analys(void){
 				Serial.println("allow_error_scale="+String(allow_error_scale));
 				Serial.println("allow_error="+String(blockage_detect.allow_error));
 				Serial.println("DUANLIAO_OUT_STATE="+String(buffer_para.DUANLIAO_OUT_STATE));
+				Serial.println("coast_delay="+String(coast_delay)+"ms");
 				Serial.print("device_state=");
 				Serial.println(state_name(device_state));
 				Serial.print("proximal_switch(PB7)=");
@@ -1278,6 +1288,28 @@ void USB_Serial_Analys(void){
 				Serial.print("set DUANLIAO_OUT_STATE  succeed! DUANLIAO_OUT_STATE=");
 				Serial.println(DUANLIAO_OUT_STATE);
 			}
+			else if(strstr(serial_buf.c_str(),"coast")){
+				int index=serial_buf.indexOf(" ");
+				if(index==-1){
+					serial_buf="";
+					Serial.println("coast_delay="+String(coast_delay)+"ms");
+					return ;
+				}
+				serial_buf=serial_buf.substring(index+1);
+				int32_t num = atoi(serial_buf.c_str());
+				if(num<0||num>10000){
+					serial_buf="";
+					Serial.println("Error: Invalid coast_delay value, range: 0-10000ms");
+					return ;
+				}
+				buffer_para.coast_delay=num;
+				coast_delay=num;
+				EEPROM.put(0, buffer_para);
+				serial_buf="";
+				Serial.print("set coast_delay succeed! coast_delay=");
+				Serial.print(coast_delay);
+				Serial.println("ms");
+			}
 			else if(strstr(serial_buf.c_str(),"version")){
 				Serial.println("version: "+String(VERSION));
 			}
@@ -1287,17 +1319,18 @@ void USB_Serial_Analys(void){
 			else{
 				Serial.println(serial_buf.c_str());
 				Serial.println("command error!");
-				Serial.print("\n+---------------------------------------------+\n");
-				Serial.print("|         Fly Buffer Command Set              |\n");
-				Serial.print("|     set steps per mm: <steps nnn CRLF>      |\n");
-				Serial.print("|     set encoder length: <encoder nnn CRLF>  |\n");
-				Serial.print("|     set timeout : <timeout nnn CRLF>        |\n");
-				Serial.print("|     read timeout: <rt CRLF>                 |\n");
-				Serial.print("|     show all info : <info CRLF>             |\n");
-				Serial.print("|     set scale: <scale nnn CRLF>             |\n");
-				Serial.print("|     set speed(r/min): <speed nnn CRLF>      |\n");
-				Serial.print("|     set I_CURRENT(mA): <I nnn CRLF>         |\n");
-				Serial.print("|     endstop out: <out n>                    |\n");
+				Serial.print("\n+-----------------------------------------------+\n");
+				Serial.print("|         Fly Buffer Command Set                |\n");
+				Serial.print("|     set steps per mm: <steps nnn CRLF>        |\n");
+				Serial.print("|     set encoder length: <encoder nnn CRLF>    |\n");
+				Serial.print("|     set timeout : <timeout nnn CRLF>          |\n");
+				Serial.print("|     read timeout: <rt CRLF>                   |\n");
+				Serial.print("|     show all info : <info CRLF>               |\n");
+				Serial.print("|     set scale: <scale nnn CRLF>               |\n");
+				Serial.print("|     set speed(r/min): <speed nnn CRLF>        |\n");
+				Serial.print("|     set I_CURRENT(mA): <I nnn CRLF>           |\n");
+				Serial.print("|     endstop out: <out n>                      |\n");
+				Serial.print("|     set coast delay(ms): <coast nnn CRLF>     |\n");
 				Serial.print("|     View version information: <version CRLF>|\n");
 				Serial.print("+-----------------------------------------------+\n\n");
 			}
