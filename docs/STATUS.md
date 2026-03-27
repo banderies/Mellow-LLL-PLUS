@@ -108,20 +108,21 @@ The firmware implements a state machine with three primary states and several tr
 | **Empty** | Open | Open | Off | Absent | No filament in device |
 | **Primed** | Closed | Closed | Off | Absent | Filament captured in extruder gears, not at hotend |
 | **Loaded** | Closed | Closed | Hall sensors | Present | Filament at hotend, normal buffer operation |
-| PrimingForward | Closed | Open | Forward | Absent | Advancing filament into gears |
-| Retracting | — | — | Back | Absent | Pulling filament back from Loaded |
-| Repriming | — | — | Forward | Absent | Re-advancing filament after retraction |
-| Unloading | — | — | Back | Absent | Removing filament from Primed |
-| Halted | — | — | Off | Absent | Stopped (button halt, timeout, or deadman release) |
+| PrimingForward | Closed | Open | Forward | Absent | Advancing filament into gears (5s timeout) |
+| Retracting | Closed | Closed→Open | Back | Absent | Pulling filament back from Loaded (no timeout) |
+| Repriming | Closed | Open→Closed | Forward | Absent | Re-advancing filament after retraction (5s timeout) |
+| Unloading | Closed→Open | — | Back | Absent | Removing filament from Primed (5s timeout) |
+| Halted | — | — | Off | Absent | Stopped (button halt, timeout, or error) |
+| StartupProbe | Closed | Closed | Back | Absent | Boot-time retraction to determine Primed vs Loaded (10s timeout) |
 
 ### Button Behavior
 
 | Button | In Stable State | During Transition | Held 2 Seconds |
 |--------|----------------|-------------------|----------------|
 | **Forward (KEY2)** | Empty→Primed, Primed→Loaded | Halt (stop motor) | Deadman: motor runs forward until released |
-| **Back (KEY1)** | Loaded→Primed, Primed→Empty | Halt (stop motor) | Deadman: motor runs backward until released |
+| **Back (KEY1)** | Loaded→Retracting, Primed→Empty | Halt (stop motor) | Deadman: motor runs backward until released |
 
-After deadman release, device enters Halted state. From Halted, forward/back buttons resume based on current switch positions.
+After deadman release, the pre-deadman state is restored if sensors are consistent (both switches still match). If sensors contradict (e.g., filament removed), state is determined from sensor reality (Empty if both open, Halted otherwise).
 
 ### Loading Sequence (Empty → Primed → Loaded)
 
@@ -136,8 +137,8 @@ After deadman release, device enters Halted state. From Halted, forward/back but
 
 1. **Loaded**: Normal printing operation
 2. User presses **back button** → motor retracts (**Retracting**)
-3. Filament retracts past distal switch, then past proximal switch → proximal opens
-4. Motor stops immediately, then **reverses** forward (**Repriming**)
+3. Filament retracts until distal switch opens (filament pulled past gears)
+4. Motor stops briefly, then **reverses** forward (**Repriming**)
 5. Filament re-advances until distal triggers → motor stops → **Primed**
 6. DUANLIAO signals absent throughout — VZ330 knows filament is not at hotend
 

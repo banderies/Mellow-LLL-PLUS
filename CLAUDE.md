@@ -22,7 +22,9 @@ To check for upstream changes: `git fetch upstream && git log HEAD..upstream/dev
 ### Custom Modifications (vs upstream)
 - **Distal filament switch** on PB14: detects filament captured in extruder gears
 - **State machine rewrite**: 3 primary states (Empty/Primed/Loaded) with button-driven transitions
-- **Button behavior**: short press = state transition or halt; 2s hold = deadman override
+- **Button behavior**: short press = state transition or halt; 2s hold = deadman override (restores pre-deadman state on release)
+- **Motor control improvements**: coast stop for hall sensor cycling (avoids EN toggling clicks), delayed EN disable after settling
+- **Startup safety**: motor starts fully de-energized (EN HIGH); state determined from EEPROM + sensors
 - See `docs/STATUS.md` for full pin analysis, state table, and sequence documentation
 
 ## Build System
@@ -59,6 +61,7 @@ lib/buffer/               # Core buffer management logic
 boards/                   # Custom board definition
 variants/F072C8/          # Hardware-specific pin mappings
 klipper/                  # Klipper configuration files for integration
+helper/buffer_control.py  # Python serial control interface (interactive + CLI)
 ```
 
 ## Core Architecture
@@ -78,7 +81,12 @@ The firmware operates as a state machine controlling filament buffer position:
 - TMC2209 stepper driver with UART control (9600 baud on PB1)
 - Speed control via VACTUAL register (default 260 RPM)
 - 64 microsteps per step
-- Software-controlled enable/direction/step pins
+- Three motor command functions:
+  - `cmd_motor_forward()` / `cmd_motor_back()`: EN LOW + set direction + VACTUAL with retry
+  - `cmd_motor_coast()`: VACTUAL=0 but EN stays LOW (coils energized with hold current, silent restart)
+  - `cmd_motor_stop()`: coast + EN HIGH (full de-energization, used for state transitions/safety)
+- Hall sensor buffer cycling (DS_Loaded) uses coast stop to avoid audible clicks from EN toggling
+- Delayed EN disable: after coast stop, EN goes HIGH after `coast_delay` ms (default 500, configurable)
 
 ### Optional MDM Module
 If connected, adds blockage detection by comparing:
@@ -105,8 +113,10 @@ scale <value>        # Set blockage error scale factor (default 2)
 speed <rpm>          # Set motor speed in RPM (default 260)
 I <mA>               # Set motor current in mA (0-3000, default 500)
 out <0|1>            # Set DUANLIAO output polarity (filament absent signal)
+coast <ms>           # Set coast delay in ms (0-10000, default 500)
 info                 # Display all current parameters + switch states
 clear                # Reset blockage detection counters
+version              # Show firmware version
 ```
 
 ## Pin Mapping Reference
@@ -137,25 +147,30 @@ The firmware uses multiple interrupt sources with specific priorities (set in `b
 ### State Machine Flow
 The firmware uses an explicit state machine (`DeviceState` enum in `buffer.cpp`):
 1. Read switches + detect button edges (short press vs 2s deadman hold)
-2. Handle deadman override (motor runs in direction while held, ignores all other logic)
+2. Handle deadman override (saves pre-deadman state; motor runs in direction while held; restores original state on release unless sensors contradict)
 3. Handle PB5/PB6 external signal control (blocking deadman)
-4. Check timeout (`is_error` from timer ISR) → transition to Halted
-5. Execute state-specific logic:
+4. Global sensor validation: both switches open → force to Empty
+5. Check timeout (`is_error` from timer ISR) → transition to Halted (active in forward states + Loaded)
+6. Execute state-specific logic:
    - **Empty**: auto-advance when proximal triggers (→ PrimingForward)
-   - **PrimingForward**: advance until distal triggers (→ Primed)
-   - **Primed**: wait for button. Forward → Loaded, Back → Unloading
-   - **Loaded**: stock hall sensor buffer logic. Back → Retracting
-   - **Retracting**: back until proximal opens, then auto-reverse (→ Repriming)
-   - **Repriming**: forward until distal triggers (→ Primed)
-   - **Unloading**: back until proximal opens (→ Empty)
+   - **PrimingForward**: advance until distal triggers (→ Primed), 5s timeout
+   - **Primed**: wait for button. Forward → Loaded, Back → Unloading. Distal open → re-prime (500ms debounce)
+   - **Loaded**: hall sensor buffer logic (upstream behavior: no-sensor = continue direction). Uses coast stop. Forward timeout active. Back → Retracting
+   - **Retracting**: motor runs back until distal opens, then auto-reverse (→ Repriming). No timeout.
+   - **Repriming**: forward until distal triggers (→ Primed), 5s timeout
+   - **Unloading**: back until proximal opens (→ Empty), 5s timeout
    - **Halted**: wait for button, determine next state from switch positions
-6. Process serial commands
+   - **StartupProbe**: retract on boot to determine Primed vs Loaded (10s timeout)
+7. Persist state to EEPROM on Primed/Loaded entry
+8. Process serial commands
 
 ### TMC2209 Communication
 Communication failures are handled with automatic retries (up to 9 attempts). The IFCNT register is monitored to verify command transmission.
 
 ### Important Variables
-- `is_error`: Global error flag that stops motor
-- `is_front`: Tracks forward movement for timeout monitoring
+- `device_state`: Current state machine state (`DeviceState` enum)
 - `motor_state`: Current motor state (Forward/Stop/Back)
+- `is_error`: Global error flag set by timer ISR on forward timeout
+- `is_front`: Tracks forward movement for timeout monitoring
+- `coast_delay`: Configurable ms delay before EN pin disable after coast stop (EEPROM-persisted)
 - `blockage_detect`: Structure holding blockage detection data

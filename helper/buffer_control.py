@@ -163,6 +163,14 @@ class BufferController:
         """Set blockage error scale factor"""
         return self.send_command(f"scale {scale}")
 
+    def set_coast_delay(self, ms: int) -> str:
+        """Set coast delay in milliseconds (0-10000)"""
+        return self.send_command(f"coast {ms}")
+
+    def get_coast_delay(self) -> str:
+        """Get current coast delay value"""
+        return self.send_command("coast")
+
     def clear_blockage(self) -> str:
         """Clear blockage detection counters"""
         return self.send_command("clear")
@@ -213,6 +221,7 @@ def interactive_mode(controller: BufferController):
     print("  steps <value>           - Set steps per mm")
     print("  encoder <length>        - Set encoder length (mm/pulse)")
     print("  scale <factor>          - Set error scale factor")
+    print("  coast [ms]              - Set/get coast delay (ms)")
     print("  clear                   - Clear blockage counters")
     print("  monitor [duration]      - Monitor serial output")
     print("  raw <command>           - Send raw command")
@@ -238,7 +247,7 @@ def interactive_mode(controller: BufferController):
                 # Re-print help
                 print("\nCommands:")
                 print("  info, speed, timeout, rt, steps, encoder, scale,")
-                print("  clear, monitor, raw, help, quit/exit")
+                print("  coast, clear, monitor, raw, help, quit/exit")
 
             elif cmd == 'info':
                 print(controller.get_info())
@@ -275,6 +284,12 @@ def interactive_mode(controller: BufferController):
                     print(controller.set_error_scale(float(args)))
                 else:
                     print("Usage: scale <factor>")
+
+            elif cmd == 'coast':
+                if args:
+                    print(controller.set_coast_delay(int(args)))
+                else:
+                    print(controller.get_coast_delay())
 
             elif cmd == 'clear':
                 print(controller.clear_blockage())
