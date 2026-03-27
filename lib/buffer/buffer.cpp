@@ -48,7 +48,6 @@ uint32_t front_time=0;//forward feed time
 const uint32_t DEFAULT_TIMEOUT = 60000;
 uint32_t timeout=60000;//timeout in ms
 bool is_error=false;//error flag, set if feeding continuously for 60s without stopping
-String serial_buf;
 
 static HardwareTimer timer(TIM6);//timeout error timer
 TIM_HandleTypeDef htim2;//hardware timer for pulse reception
@@ -92,12 +91,10 @@ static const char* state_name(DeviceState s) {
 	}
 }
 
-// Persisted device state in EEPROM (after Buffer_Parameter struct, sizeof=36)
-const int EEPROM_ADDR_DEVICE_STATE = 40;
+// Persisted device state values (stored in buffer_para.saved_device_state)
 const uint8_t SAVED_STATE_UNKNOWN = 0;
 const uint8_t SAVED_STATE_PRIMED = 1;
 const uint8_t SAVED_STATE_LOADED = 2;
-static uint8_t last_saved_state = SAVED_STATE_UNKNOWN;
 
 const uint32_t DEFAULT_STEPS = 916;
 uint32_t steps=916;//pulses per mm
@@ -118,13 +115,6 @@ uint32_t I_CURRENT = 500;		//motor current (mA)
 const uint32_t DEFAULT_COAST_DELAY = 500;
 uint32_t coast_delay = 500;	//ms to keep coils energized after buffer stop
 
-const int EEPROM_ADDR_TIMEOUT = 0;
-const int EEPROM_ADDR_STEPS = 4;
-const int EEPROM_ADDR_ENCODER_LENGTH = 8;
-const int EEPROM_ADDR_ERROR_SCALE = 12;
-const int EEPROM_ADDR_SPEED = 16;
-const int EEPROM_ADDR_I_CURRENT = 20;
-const int EEPROM_ADDR_ENDSTOP_OUT = 24;
 
 
 
@@ -166,14 +156,11 @@ void Blockage_Detect(void);
 void Main_Logic(void);
 float fastAtof(const char *s);
 void Signal_Dir_Init(void);
-// void Buffer_S3_IT_Callback(void);
-// void Buffer_S2_IT_Callback(void);
-// void Buffer_S1_IT_Callback(void);
 
 void buffer_parameter_init(Buffer_Parameter &buffer_para){
 	EEPROM.get(0, buffer_para);
-	if(buffer_para.magic_number!=0x55AA){
-		buffer_para=Buffer_Parameter{DEFAULT_TIMEOUT,DEFAULT_STEPS,DEFAULT_ENCODER_LENGTH,DEFAULT_ALLOW_ERROR_SCALE,260,I_CURRENT,DUANLIAO_OUT_STATE,DEFAULT_COAST_DELAY,0x55AA};
+	if(buffer_para.magic_number!=0x55AB){
+		buffer_para={0x55AB,DEFAULT_TIMEOUT,DEFAULT_STEPS,DEFAULT_ENCODER_LENGTH,DEFAULT_ALLOW_ERROR_SCALE,260,I_CURRENT,DUANLIAO_OUT_STATE,DEFAULT_COAST_DELAY,SAVED_STATE_UNKNOWN};
 		EEPROM.put(0, buffer_para);
 	}
 	timeout=buffer_para.timeout;
@@ -209,7 +196,7 @@ void buffer_init(){
   Signal_Dir_Init();
   delay(1000);
 
-  VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715) ;  //VACTUAL register value
+  VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715f) ;  //VACTUAL register value
 
 
 
@@ -267,8 +254,6 @@ void buffer_loop()
 			{
 				lastToggleTime = millis();
 				digitalToggle(ERR_LED);
-				// Serial.println("CNT:"+String(TIM2->CNT));
-				// Serial.println("	mdm_pulse_cnt:"+String(blockage_detect.mdm_pulse_cnt));
 			}
 
 
@@ -301,9 +286,6 @@ void buffer_sensor_init(){
   pinMode(ENDSTOP_3,INPUT);
   pinMode(DISTAL_SWITCH,INPUT_PULLUP); // distal filament switch on PB14; HIGH=absent, LOW=present
 
-//   attachInterrupt(HALL1,&Buffer_S3_IT_Callback,RISING);
-//   attachInterrupt(HALL2,&Buffer_S2_IT_Callback,RISING);
-//   attachInterrupt(HALL3,&Buffer_S1_IT_Callback,RISING);
 
   pinMode(KEY1,INPUT);
   pinMode(KEY2,INPUT);
@@ -443,7 +425,7 @@ void motor_control(void)
 	static bool first_run = true;
 	if(first_run) {
 		first_run = false;
-		EEPROM.get(EEPROM_ADDR_DEVICE_STATE, last_saved_state);
+		uint8_t last_saved_state = buffer_para.saved_device_state;
 
 		if(proximal && distal) {
 			if(last_saved_state == SAVED_STATE_PRIMED) {
@@ -484,11 +466,17 @@ void motor_control(void)
 	if(key2_just_released) key2_consumed = false;
 
 	// --- Deadman switch detection (2s hold, only one at a time) ---
-	// Save pre-deadman state so we can restore it on release
+	// Capture state at press time (before back_press/fwd_press transitions fire),
+	// so deadman has the correct pre-press state even though the initial press edge
+	// may have already triggered a state transition.
+	static DeviceState state_at_press = DS_Empty;
 	static DeviceState pre_deadman_state = DS_Empty;
+	if(key1_just_pressed || key2_just_pressed) {
+		state_at_press = device_state;
+	}
 	if(device_state != DS_DeadmanBack && device_state != DS_DeadmanForward &&
 	   key1_held && !key2_held && millis() - key1_press_times >= 2000) {
-		pre_deadman_state = device_state;
+		pre_deadman_state = state_at_press;
 		cmd_motor_back();
 		is_front = false;
 		key1_consumed = true;
@@ -496,30 +484,33 @@ void motor_control(void)
 	}
 	if(device_state != DS_DeadmanForward && device_state != DS_DeadmanBack &&
 	   key2_held && !key1_held && millis() - key2_press_times >= 2000) {
-		pre_deadman_state = device_state;
+		pre_deadman_state = state_at_press;
 		cmd_motor_forward();
 		is_front = false;
 		key2_consumed = true;
 		device_state = DS_DeadmanForward;
 	}
 
-	// Handle deadman release → restore pre-deadman state, overridden by sensor reality
+	// Handle deadman release → determine state from sensors
+	// Only restore pre-deadman state for Loaded (indistinguishable from Primed by sensors alone)
 	if(device_state == DS_DeadmanBack && key1_just_released) {
 		cmd_motor_stop();
 		is_front = false;
 		front_time = 0;
-		if(!proximal && !distal)      device_state = DS_Empty;
-		else if(proximal && distal)   device_state = pre_deadman_state;
-		else                          device_state = DS_Halted;
+		if(!proximal && !distal)                                device_state = DS_Empty;
+		else if(proximal && distal && pre_deadman_state == DS_Loaded) device_state = DS_Loaded;
+		else if(proximal && distal)                             device_state = DS_Primed;
+		else                                                    device_state = DS_Halted;
 		return;
 	}
 	if(device_state == DS_DeadmanForward && key2_just_released) {
 		cmd_motor_stop();
 		is_front = false;
 		front_time = 0;
-		if(!proximal && !distal)      device_state = DS_Empty;
-		else if(proximal && distal)   device_state = pre_deadman_state;
-		else                          device_state = DS_Halted;
+		if(!proximal && !distal)                                device_state = DS_Empty;
+		else if(proximal && distal && pre_deadman_state == DS_Loaded) device_state = DS_Loaded;
+		else if(proximal && distal)                             device_state = DS_Primed;
+		else                                                    device_state = DS_Halted;
 		return;
 	}
 
@@ -952,12 +943,12 @@ void motor_control(void)
 	}
 
 	// Persist state to EEPROM when entering Primed or Loaded (only on change)
-	if(device_state == DS_Primed && last_saved_state != SAVED_STATE_PRIMED) {
-		last_saved_state = SAVED_STATE_PRIMED;
-		EEPROM.put(EEPROM_ADDR_DEVICE_STATE, last_saved_state);
-	} else if(device_state == DS_Loaded && last_saved_state != SAVED_STATE_LOADED) {
-		last_saved_state = SAVED_STATE_LOADED;
-		EEPROM.put(EEPROM_ADDR_DEVICE_STATE, last_saved_state);
+	if(device_state == DS_Primed && buffer_para.saved_device_state != SAVED_STATE_PRIMED) {
+		buffer_para.saved_device_state = SAVED_STATE_PRIMED;
+		EEPROM.put(0, buffer_para);
+	} else if(device_state == DS_Loaded && buffer_para.saved_device_state != SAVED_STATE_LOADED) {
+		buffer_para.saved_device_state = SAVED_STATE_LOADED;
+		EEPROM.put(0, buffer_para);
 	}
 }
 
@@ -1033,7 +1024,6 @@ void key2_it_callback(void){
 
 void Recv_MDM_Pulse_IT_Callback(void){
 	blockage_detect.mdm_pulse_cnt++;
-	// Serial.println("mdm_pulse_cnt:"+String(blockage_detect.mdm_pulse_cnt));
 }
 
 void Dir_IT_Callback(void){
@@ -1042,64 +1032,6 @@ void Dir_IT_Callback(void){
 	else 	SIGNAL_COUNT_DOWN();	//DIR low = count down
 }
 
-// void Buffer_S3_IT_Callback(void){
-// 	last_motor_state=motor_state;
-// 	motor_state=Back;
-// 	is_front=false;
-// 	front_time=0;
-// }
-
-// void Buffer_S2_IT_Callback(void){
-// 	last_motor_state=motor_state;
-// 	motor_state=Stop;
-// 	is_front=false;
-// 	front_time=0;
-// }
-
-// void Buffer_S1_IT_Callback(void){
-// 	last_motor_state=motor_state;
-// 	motor_state=Forward;
-// 	is_front=true;	
-
-// }
-
-
-
-void buffer_debug(void){
-	// Serial.print("buffer1_pos1_sensor_state:");Serial.println(buffer.buffer1_pos1_sensor_state);
-	// Serial.print("buffer1_pos2_sensor_state:");Serial.println(buffer.buffer1_pos2_sensor_state);
-	// Serial.print("buffer1_pos3_sensor_state:");Serial.println(buffer.buffer1_pos3_sensor_state);
-	// Serial.print("buffer1_material_swtich_state:");Serial.println(buffer.buffer1_material_swtich_state);
-	// Serial.print("key1:");Serial.println(buffer.key1);
-	// Serial.print("key2:");Serial.println(buffer.key2);
-	static int i=0;
-	if(i<0x1ff){
-		Serial.print("i:");
-		Serial.println(i);
-		driver.GCONF(i);
-		driver.PWMCONF(i);
-		i++;
-	}
-	uint32_t gconf = driver.GCONF();
-	uint32_t chopconf=driver.CHOPCONF();
-	uint32_t pwmconf = driver.PWMCONF();
-	if(driver.CRCerror){
-		Serial.println("CRCerror");
-	}
-	else{
-		Serial.print("GCONF():0x");
-		Serial.println(gconf,HEX);
-		Serial.print("CHOPCONF():0x");
-		char buf[11];  // "0x" + 8 digits + null terminator
-		sprintf(buf, "%08lX", chopconf);
-		Serial.println(buf);
-		Serial.print("PWMCONF():0x");
-		sprintf(buf, "%08lX", pwmconf);
-		Serial.println(buf);
-		Serial.println("");
-	}
-  	delay(1000);
-}
 
 
 /**
@@ -1107,237 +1039,210 @@ void buffer_debug(void){
   * @param  null
   * @retval null
 **/
+// Helper: find argument after first space in command buffer, or NULL if none
+static const char* cmd_arg(const char* buf) {
+	const char* sp = strchr(buf, ' ');
+	return sp ? sp + 1 : NULL;
+}
+
 void USB_Serial_Analys(void){
 
-	static String serial_buf;
+	static char serial_buf[64];
+	static uint8_t serial_buf_len = 0;
+
 	if(Serial.available()){
 		char c=Serial.read();
 		if(c=='\n'){
-			if(strstr(serial_buf.c_str(),"rt")){
+			serial_buf[serial_buf_len] = '\0';
+			const char* arg = cmd_arg(serial_buf);
+
+			if(strstr(serial_buf,"rt")){
 				Serial.print("read timeout=");
-				Serial.println(timeout);				
-			}
-			else if(strstr(serial_buf.c_str(),"timeout")){
-				int index=serial_buf.indexOf(" ");
-				if(index==-1){
-					serial_buf="";
-					Serial.println("Error: Invalid timeout value.");
-				}
-				serial_buf=serial_buf.substring(index+1);
-				int64_t num=serial_buf.toInt();
-				if(num<0||num>0xffffffff){
-					serial_buf="";
-					Serial.println("Error: Invalid timeout value.");
-				}
-				buffer_para.timeout=num;
-				timeout=num;
-				EEPROM.put(0, buffer_para);
-				serial_buf="";
-				Serial.print("set timeout succeed! timeout=");
 				Serial.println(timeout);
-
 			}
-			else if(strstr(serial_buf.c_str(),"steps")){
-				int index=serial_buf.indexOf(" ");
-				if(index==-1){
-					serial_buf="";
+			else if(strstr(serial_buf,"timeout")){
+				if(!arg){
+					Serial.println("Error: Invalid timeout value.");
+				} else {
+					int64_t num = atol(arg);
+					if(num<0||num>(int64_t)0xffffffff){
+						Serial.println("Error: Invalid timeout value.");
+					} else {
+						buffer_para.timeout=num;
+						timeout=num;
+						EEPROM.put(0, buffer_para);
+						Serial.print("set timeout succeed! timeout=");
+						Serial.println(timeout);
+					}
+				}
+			}
+			else if(strstr(serial_buf,"steps")){
+				if(!arg){
 					Serial.println("Error: Invalid steps value.");
+				} else {
+					int64_t num = atol(arg);
+					if(num<0||num>51200){
+						Serial.println("Error: Invalid steps value.");
+					} else {
+						buffer_para.steps=num;
+						steps=num;
+						EEPROM.put(0, buffer_para);
+						Serial.print("set steps succeed! steps=");
+						Serial.println(steps);
+						if(connet_mdm_flag){
+							REIN_TIM_SIGNAL_COUNT_DeInit();
+							REIN_TIM_SIGNAL_COUNT_Init();
+						}
+					}
 				}
-				serial_buf=serial_buf.substring(index+1);
-				int64_t num=serial_buf.toInt();
-				if(num<0||num>51200){
-					serial_buf="";
-					Serial.println("Error: Invalid steps value.");
-				}
-				buffer_para.steps=num;
-				steps=num;
-				EEPROM.put(0, buffer_para);
-				serial_buf="";
-				Serial.print("set steps succeed! steps=");
-				Serial.println(steps);
-				if(connet_mdm_flag){
-					REIN_TIM_SIGNAL_COUNT_DeInit();
-					REIN_TIM_SIGNAL_COUNT_Init();
-				}
-
-			}		
-			else if(strstr(serial_buf.c_str(),"clear")){
-				//reset counters
+			}
+			else if(strstr(serial_buf,"clear")){
 				blockage_detect.actual_distance=0;
 				blockage_detect.target_distance=0;
 				blockage_detect.mdm_pulse_cnt=0;
-				blockage_detect.pulse_cnt=0;				
+				blockage_detect.pulse_cnt=0;
 			}
-			else if(strstr(serial_buf.c_str(),"encoder")){
-				int index=serial_buf.indexOf(" ");
-				if(index==-1){
-					serial_buf="";
+			else if(strstr(serial_buf,"encoder")){
+				if(!arg){
 					Serial.println("Error: Invalid encoder value.");
+				} else {
+					float num = fastAtof(arg);
+					if(num<0){
+						Serial.println("Error: Invalid encoder length value.");
+					} else {
+						buffer_para.encoder_length=num;
+						encoder_length=num;
+						EEPROM.put(0, buffer_para);
+						blockage_detect.allow_error = encoder_length*allow_error_scale;
+						Serial.print("set encoder length succeed! encoder_length=");
+						Serial.println(encoder_length);
+					}
 				}
-				serial_buf=serial_buf.substring(index+1);
-				// float num = serial_buf.toFloat();
-				float num = fastAtof(serial_buf.c_str());
-				if(num<0){
-					serial_buf="";
-					Serial.println("Error: Invalid encoder length value.");
-				}
-				buffer_para.encoder_length=num;
-				encoder_length=num;
-				EEPROM.put(0, buffer_para);
-				serial_buf="";
-				blockage_detect.allow_error = encoder_length*allow_error_scale;
-				Serial.print("set encoder length succeed! encoder_length=");
-				Serial.println(encoder_length);
 			}
-			else if(strstr(serial_buf.c_str(),"info")){
-				Serial.println("encoder_length="+String(encoder_length));
-				Serial.println("timeout="+String(timeout));
-				Serial.println("steps="+String(steps));
-				Serial.println("speed="+String(SPEED));
-				Serial.println("allow_error_scale="+String(allow_error_scale));
-				Serial.println("allow_error="+String(blockage_detect.allow_error));
-				Serial.println("DUANLIAO_OUT_STATE="+String(buffer_para.DUANLIAO_OUT_STATE));
-				Serial.println("coast_delay="+String(coast_delay)+"ms");
-				Serial.print("device_state=");
-				Serial.println(state_name(device_state));
+			else if(strstr(serial_buf,"info")){
+				Serial.print("encoder_length="); Serial.println(encoder_length);
+				Serial.print("timeout="); Serial.println(timeout);
+				Serial.print("steps="); Serial.println(steps);
+				Serial.print("speed="); Serial.println(SPEED);
+				Serial.print("allow_error_scale="); Serial.println(allow_error_scale);
+				Serial.print("allow_error="); Serial.println(blockage_detect.allow_error);
+				Serial.print("DUANLIAO_OUT_STATE="); Serial.println(buffer_para.DUANLIAO_OUT_STATE);
+				Serial.print("coast_delay="); Serial.print(coast_delay); Serial.println("ms");
+				Serial.print("device_state="); Serial.println(state_name(device_state));
 				Serial.print("proximal_switch(PB7)=");
 				Serial.println(digitalRead(ENDSTOP_3) ? "OPEN (no filament)" : "CLOSED (filament present)");
 				Serial.print("distal_switch(PB14)=");
 				Serial.println(digitalRead(DISTAL_SWITCH) ? "OPEN (no filament)" : "CLOSED (filament present)");
-			}			
-			else if(strstr(serial_buf.c_str(),"scale")){
-				int index=serial_buf.indexOf(" ");
-				if(index==-1){
-					serial_buf="";
+			}
+			else if(strstr(serial_buf,"scale")){
+				if(!arg){
 					Serial.println("Error: Invalid scale value.");
+				} else {
+					float num = fastAtof(arg);
+					if(num<0){
+						Serial.println("Error: Invalid scale length value.");
+					} else {
+						buffer_para.allow_error_scale=num;
+						allow_error_scale=num;
+						EEPROM.put(0, buffer_para);
+						blockage_detect.allow_error = encoder_length*allow_error_scale;
+						Serial.print("set scale length succeed! allow_error_scale=");
+						Serial.println(allow_error_scale);
+					}
 				}
-				serial_buf=serial_buf.substring(index+1);
-				// float num = serial_buf.toFloat();
-				float num = fastAtof(serial_buf.c_str());
-				if(num<0){
-					serial_buf="";
-					Serial.println("Error: Invalid scale length value.");
-				}
-				buffer_para.allow_error_scale=num;
-				allow_error_scale=num;
-				EEPROM.put(0, buffer_para);
-				serial_buf="";
-				blockage_detect.allow_error = encoder_length*allow_error_scale;
-				Serial.print("set scale length succeed! allow_error_scale=");
-				Serial.println(allow_error_scale);
-
 			}
-			else if(strstr(serial_buf.c_str(),"speed")){
-				int index=serial_buf.indexOf(" ");
-				if(index==-1){
-					serial_buf="";
-					Serial.println("speed: "+String(SPEED));
-					return ;
+			else if(strstr(serial_buf,"speed")){
+				if(!arg){
+					Serial.print("speed: "); Serial.println(SPEED);
+				} else {
+					float num = fastAtof(arg);
+					if(num<0){
+						Serial.println("Error: Invalid speed value.");
+					} else {
+						buffer_para.SPEED=num;
+						SPEED=num;
+						VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715f);
+						EEPROM.put(0, buffer_para);
+						Serial.print("set speed succeed! speed=");
+						Serial.println(SPEED);
+					}
 				}
-				serial_buf=serial_buf.substring(index+1);
-				// float num = serial_buf.toFloat();
-				float num = fastAtof(serial_buf.c_str());
-				if(num<0){
-					serial_buf="";
-					Serial.println("Error: Invalid speed  value.");
-				}
-				buffer_para.SPEED=num;
-				SPEED=num;
-				VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715) ;  //VACTUAL register value
-				EEPROM.put(0, buffer_para);
-				serial_buf="";
-				Serial.print("set speed  succeed! speed=");
-				Serial.println(SPEED);
-			}			
-			else if(strstr(serial_buf.c_str(),"I")){
-				int index=serial_buf.indexOf(" ");
-				if(index==-1){
-					serial_buf="";
-					Serial.println("I_CURRENT="+String(I_CURRENT));
-					return ;
-				}
-				serial_buf=serial_buf.substring(index+1);
-				// float num = serial_buf.toFloat();
-				int32_t num = atoi(serial_buf.c_str());
-				if(num<0||num>3000){
-					serial_buf="";
-					Serial.println("Error: Invalid I_CURRENT  value,range:0-3000mA");
-					return ;
-				}
-				buffer_para.I_CURRENT=num;
-				I_CURRENT=num;
-				EEPROM.put(0, buffer_para);
-				serial_buf="";
-				Serial.print("set I_CURRENT  succeed! I_CURRENT=");
-				Serial.println(I_CURRENT);
 			}
-
-			else if(strstr(serial_buf.c_str(),"out")){
-				int index=serial_buf.indexOf(" ");
-				if(index==-1){
-					serial_buf="";
-					Serial.println("DUANLIAO_OUT_STATE="+String(buffer_para.DUANLIAO_OUT_STATE));
-					return ;
+			else if(strstr(serial_buf,"I")){
+				if(!arg){
+					Serial.print("I_CURRENT="); Serial.println(I_CURRENT);
+				} else {
+					int32_t num = atoi(arg);
+					if(num<0||num>3000){
+						Serial.println("Error: Invalid I_CURRENT value, range: 0-3000mA");
+					} else {
+						buffer_para.I_CURRENT=num;
+						I_CURRENT=num;
+						EEPROM.put(0, buffer_para);
+						Serial.print("set I_CURRENT succeed! I_CURRENT=");
+						Serial.println(I_CURRENT);
+					}
 				}
-				serial_buf=serial_buf.substring(index+1);
-				bool state = atoi(serial_buf.c_str());
-				buffer_para.DUANLIAO_OUT_STATE=state;
-				DUANLIAO_OUT_STATE=state;
-				EEPROM.put(0, buffer_para);
-				serial_buf="";
-				Serial.print("set DUANLIAO_OUT_STATE  succeed! DUANLIAO_OUT_STATE=");
-				Serial.println(DUANLIAO_OUT_STATE);
 			}
-			else if(strstr(serial_buf.c_str(),"coast")){
-				int index=serial_buf.indexOf(" ");
-				if(index==-1){
-					serial_buf="";
-					Serial.println("coast_delay="+String(coast_delay)+"ms");
-					return ;
+			else if(strstr(serial_buf,"out")){
+				if(!arg){
+					Serial.print("DUANLIAO_OUT_STATE="); Serial.println(buffer_para.DUANLIAO_OUT_STATE);
+				} else {
+					bool state = atoi(arg);
+					buffer_para.DUANLIAO_OUT_STATE=state;
+					DUANLIAO_OUT_STATE=state;
+					EEPROM.put(0, buffer_para);
+					Serial.print("set DUANLIAO_OUT_STATE succeed! DUANLIAO_OUT_STATE=");
+					Serial.println(DUANLIAO_OUT_STATE);
 				}
-				serial_buf=serial_buf.substring(index+1);
-				int32_t num = atoi(serial_buf.c_str());
-				if(num<0||num>10000){
-					serial_buf="";
-					Serial.println("Error: Invalid coast_delay value, range: 0-10000ms");
-					return ;
+			}
+			else if(strstr(serial_buf,"coast")){
+				if(!arg){
+					Serial.print("coast_delay="); Serial.print(coast_delay); Serial.println("ms");
+				} else {
+					int32_t num = atoi(arg);
+					if(num<0||num>10000){
+						Serial.println("Error: Invalid coast_delay value, range: 0-10000ms");
+					} else {
+						buffer_para.coast_delay=num;
+						coast_delay=num;
+						EEPROM.put(0, buffer_para);
+						Serial.print("set coast_delay succeed! coast_delay=");
+						Serial.print(coast_delay);
+						Serial.println("ms");
+					}
 				}
-				buffer_para.coast_delay=num;
-				coast_delay=num;
-				EEPROM.put(0, buffer_para);
-				serial_buf="";
-				Serial.print("set coast_delay succeed! coast_delay=");
-				Serial.print(coast_delay);
-				Serial.println("ms");
 			}
-			else if(strstr(serial_buf.c_str(),"version")){
-				Serial.println("version: "+String(VERSION));
+			else if(strstr(serial_buf,"version")){
+				Serial.print("version: "); Serial.println(VERSION);
 			}
-
-
-
 			else{
-				Serial.println(serial_buf.c_str());
+				Serial.println(serial_buf);
 				Serial.println("command error!");
-				Serial.print("\n+-----------------------------------------------+\n");
-				Serial.print("|         Fly Buffer Command Set                |\n");
-				Serial.print("|     set steps per mm: <steps nnn CRLF>        |\n");
-				Serial.print("|     set encoder length: <encoder nnn CRLF>    |\n");
-				Serial.print("|     set timeout : <timeout nnn CRLF>          |\n");
-				Serial.print("|     read timeout: <rt CRLF>                   |\n");
-				Serial.print("|     show all info : <info CRLF>               |\n");
-				Serial.print("|     set scale: <scale nnn CRLF>               |\n");
-				Serial.print("|     set speed(r/min): <speed nnn CRLF>        |\n");
-				Serial.print("|     set I_CURRENT(mA): <I nnn CRLF>           |\n");
-				Serial.print("|     endstop out: <out n>                      |\n");
-				Serial.print("|     set coast delay(ms): <coast nnn CRLF>     |\n");
-				Serial.print("|     View version information: <version CRLF>|\n");
-				Serial.print("+-----------------------------------------------+\n\n");
+				Serial.print(
+					"\n+-----------------------------------------------+\n"
+					"|         Fly Buffer Command Set                |\n"
+					"|  timeout <ms>    - set feed timeout            |\n"
+					"|  rt              - read timeout                |\n"
+					"|  steps <n>       - set steps/mm                |\n"
+					"|  encoder <n>     - set encoder length          |\n"
+					"|  scale <n>       - set error scale             |\n"
+					"|  speed <rpm>     - set motor speed             |\n"
+					"|  I <mA>          - set motor current           |\n"
+					"|  out <0|1>       - set endstop polarity        |\n"
+					"|  coast <ms>      - set coast delay             |\n"
+					"|  info            - show all parameters         |\n"
+					"|  clear           - reset blockage counters     |\n"
+					"|  version         - show firmware version       |\n"
+					"+-----------------------------------------------+\n\n"
+				);
 			}
-			serial_buf="";
+			serial_buf_len = 0;
 
 		}
-		else  serial_buf+=c;
+		else if(serial_buf_len < sizeof(serial_buf) - 1) {
+			serial_buf[serial_buf_len++] = c;
+		}
 	}
 }
 
@@ -1356,8 +1261,6 @@ bool Check_Connet_MDM(void){
 	//read MDM filament pin state
 	pinMode(MDM_DPIN,INPUT);
 	bool mdm_state=digitalRead(MDM_DPIN);
-	// Serial.print("mdm_state:");
-	// Serial.println(mdm_state);
 
 	//configure opposite pull direction and re-read; unchanged level = connected
 	if(mdm_state){//HIGH, configure pull-down
@@ -1498,7 +1401,6 @@ void Blockage_Detect(void){
 		if(blockage_detect.extrusion_pulse_cnt<0) blockage_detect.target_distance=0;
 		else blockage_detect.target_distance=(blockage_detect.extrusion_pulse_cnt)/steps;
 
-		// Serial.println("extrusion_pulse_cnt:"+String(blockage_detect.extrusion_pulse_cnt));
 	}
 
 	blockage_detect.actual_distance=blockage_detect.mdm_pulse_cnt*encoder_length;//actual distance
@@ -1514,10 +1416,6 @@ void Blockage_Detect(void){
 	//require two consecutive blockage detections to confirm; single = false trigger
 	if(!detect_blockage){//no blockage detected yet
 		if(blockage_detect.target_distance!=last_target_distance){
-			// Serial.println("dir:"+String((bool)SIGNAL_COUNT_READ_DIR_IO()));
-
-			// Serial.print("target_distance:"+String(blockage_detect.target_distance));
-			// Serial.println("	actual_distance:"+String(blockage_detect.actual_distance));
 
 			//blockage check
 			if(abs(blockage_detect.distance_error)>blockage_detect.allow_error&&blockage_detect.target_distance>=blockage_detect.allow_error){//blockage detected
@@ -1525,9 +1423,6 @@ void Blockage_Detect(void){
 				detect_blockage=true;
 				detect_blockage_time=millis();
 
-				// Serial.print("target_distance:"+String(blockage_detect.target_distance));
-				// Serial.println("	actual_distance:"+String(blockage_detect.actual_distance));
-				// Serial.println("detect over error:"+String(blockage_detect.distance_error));
 
 				//reset counters
 				blockage_detect.actual_distance=0;
@@ -1544,7 +1439,7 @@ void Blockage_Detect(void){
 		if(millis()-detect_blockage_time>=100){
 			if(abs(blockage_detect.distance_error)>blockage_detect.allow_error){//blockage confirmed
 				//trigger blockage alarm
-				// Serial.println("blockage trigger");
+;
 				blockage_detect.blockage_flag=true;
 				blockage_inform_times=millis();
 				digitalWrite(DULIAO,LOW);			

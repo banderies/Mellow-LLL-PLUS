@@ -90,7 +90,7 @@
 
 static int32_t SPEED=260;  //speed (RPM)
 #define Move_Divide_NUM			((int32_t)(64))		//microsteps per step
-static int32_t VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715) ;  //VACTUAL register value
+static int32_t VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715f) ;  //VACTUAL register value
 
 #define STOP 0				//stop
 #define WRITE_EN_PIN(x) digitalWrite(EN_PIN,x)//set EN pin
@@ -141,6 +141,7 @@ typedef struct BlockageDetect
 }BlockageDetect;
 
 struct Buffer_Parameter{
+	uint16_t magic_number;        // Must be first — validated on boot (0x55AB)
 	uint32_t timeout;
 	uint32_t steps;
 	float encoder_length;
@@ -149,7 +150,7 @@ struct Buffer_Parameter{
 	uint32_t I_CURRENT;
 	bool DUANLIAO_OUT_STATE;
 	uint32_t coast_delay;
-	uint16_t magic_number;
+	uint8_t saved_device_state;   // Persisted device state (0=unknown, 1=primed, 2=loaded)
 };
 
 extern void buffer_sensor_init();
@@ -161,7 +162,6 @@ extern void motor_control(void);
 extern void buffer_init();
 extern void buffer_loop(void);
 extern void timer_it_callback();
-extern void buffer_debug(void);
 
 extern bool is_error;
 extern uint32_t front_time;//forward feed time

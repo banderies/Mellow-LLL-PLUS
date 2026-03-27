@@ -1,0 +1,6 @@
+{
+  "name": "TMCStepper",
+  "version": "0.8.7-local",
+  "description": "Local fork: TMC2209-only, double-precision eliminated for Cortex-M0",
+  "frameworks": "arduino"
+}
