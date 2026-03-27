@@ -371,7 +371,12 @@ static void cmd_motor_forward() {
 	WRITE_EN_PIN(0);
 	if(motor_state == Back) driver.VACTUAL(STOP);
 	driver.shaft(FORWARD);
+	uint8_t cnt = driver.IFCNT();
 	driver.VACTUAL(VACTRUAL_VALUE);
+	uint8_t retries = 9;
+	while(cnt == driver.IFCNT() && retries--) {
+		driver.VACTUAL(VACTRUAL_VALUE);
+	}
 	motor_state = Forward;
 	last_motor_state = Forward;
 }
@@ -380,7 +385,12 @@ static void cmd_motor_back() {
 	WRITE_EN_PIN(0);
 	if(motor_state == Forward) driver.VACTUAL(STOP);
 	driver.shaft(BACK);
+	uint8_t cnt = driver.IFCNT();
 	driver.VACTUAL(VACTRUAL_VALUE);
+	uint8_t retries = 9;
+	while(cnt == driver.IFCNT() && retries--) {
+		driver.VACTUAL(VACTRUAL_VALUE);
+	}
 	motor_state = Back;
 	last_motor_state = Back;
 }
@@ -570,6 +580,12 @@ void motor_control(void)
 	// --- State machine ---
 	static uint32_t transition_start = 0; // Timestamp when a transition began
 	static const uint32_t TRANSITION_TIMEOUT = 5000; // 5s timeout for priming/unloading
+	static DeviceState prev_device_state = DS_Empty;
+	static uint32_t state_entry_time = 0;
+	if(device_state != prev_device_state) {
+		state_entry_time = millis();
+		prev_device_state = device_state;
+	}
 
 	switch(device_state) {
 
@@ -637,13 +653,12 @@ void motor_control(void)
 			digitalWrite(START_LED, 0);
 
 			// Sensor validation: react to switch changes
+			// (skip distal check for 500ms after entering to avoid switch bounce)
 			if(!proximal) {
-				// Filament pulled out → Empty
 				device_state = DS_Empty;
 				break;
 			}
-			if(!distal) {
-				// Filament slipped backward past gears → re-advance
+			if(!distal && millis() - state_entry_time >= 500) {
 				cmd_motor_forward();
 				front_time = 0;
 				transition_start = millis();
@@ -652,7 +667,7 @@ void motor_control(void)
 			}
 
 			if(fwd_press) {
-				device_state = DS_Loaded; // Enter buffer operation
+				device_state = DS_Loaded;
 			} else if(back_press) {
 				cmd_motor_back();
 				transition_start = millis();
@@ -727,41 +742,11 @@ void motor_control(void)
 			}
 
 			if(new_state != motor_state) {
-				uint8_t write_cnt = 0;
-				uint8_t retry_count = 9;
-
 				switch(new_state) {
-					case Forward:
-						WRITE_EN_PIN(0);
-						if(motor_state == Back) driver.VACTUAL(STOP);
-						driver.shaft(FORWARD);
-						write_cnt = driver.IFCNT();
-						driver.VACTUAL(VACTRUAL_VALUE);
-						while(write_cnt == driver.IFCNT() && retry_count--) {
-							driver.VACTUAL(VACTRUAL_VALUE);
-						}
-						break;
-					case Stop:
-						write_cnt = driver.IFCNT();
-						driver.VACTUAL(STOP);
-						while(write_cnt == driver.IFCNT() && retry_count--) {
-							driver.VACTUAL(STOP);
-						}
-						WRITE_EN_PIN(1);
-						break;
-					case Back:
-						WRITE_EN_PIN(0);
-						if(motor_state == Forward) driver.VACTUAL(STOP);
-						driver.shaft(BACK);
-						write_cnt = driver.IFCNT();
-						driver.VACTUAL(VACTRUAL_VALUE);
-						while(write_cnt == driver.IFCNT() && retry_count--) {
-							driver.VACTUAL(VACTRUAL_VALUE);
-						}
-						break;
+					case Forward: cmd_motor_forward(); break;
+					case Stop:    cmd_motor_stop();    break;
+					case Back:    cmd_motor_back();     break;
 				}
-				motor_state = new_state;
-				last_motor_state = new_state;
 			}
 			break;
 		}
