@@ -82,35 +82,78 @@ During automated filament unloading, the extruder retracts filament back toward 
 A second limit switch is added to the filament path **distal** to the extruder gears (i.e., on the far side, between the gears and the hotend). This creates two sensing points:
 
 ```
-                     Filament path direction (loading -->)
+    Filament path (loading direction -->)
 
-    [Buffer] ----> [Proximal Switch (PB7)] ----> [Extruder Gears] ----> [Distal Switch (PB14)] ----> [Hotend]
-                    (existing, stock)              (drive mechanism)      (new, custom)
+    [User inserts] → [Proximal Switch (PB7)] → [Extruder Gears] → [Distal Switch (PB14)] → [Bowden to buffer/hotend]
+                      (stock, detects entry)    (drive mechanism)   (custom, detects gear capture)
 ```
+
+**Physical layout detail:** The user inserts filament at the proximal switch first. The filament must be pushed slightly past the proximal switch to reach the extruder gears. Once the gears grab it, the motor drives it forward past the distal switch, through the bowden tube, and ultimately to the hotend. The buffer's hall effect sensors detect backpressure when the filament reaches the hotend.
 
 ### Sensor Terminology
 
 | Switch | Pin | Position | Firmware Name |
 |--------|-----|----------|---------------|
-| **Proximal** | PB7 | Before extruder gears (buffer side) | `ENDSTOP_3` (existing) |
+| **Proximal** | PB7 | Before extruder gears (loading side) | `ENDSTOP_3` (existing) |
 | **Distal** | PB14 | After extruder gears (hotend side) | `DISTAL_SWITCH` (custom) |
 
-Both are normally-open (NO) switches: LOW = filament present (switch closed), HIGH = filament absent (switch open). PB14 is configured as INPUT_PULLUP in firmware.
+Both are normally-open (NO) switches wired COM→GND, NO→pin. LOW = filament present (switch closed), HIGH = filament absent (switch open). PB14 is configured as INPUT_PULLUP in firmware.
 
-### New Filament States
+### Device States
 
-The two switches together define four meaningful states:
+The firmware implements a state machine with three primary states and several transition states:
 
-| Proximal (PB7) | Distal (PB14) | Filament Position | Action |
-|----------------|--------------|-------------------|--------|
-| Open (absent) | Open (absent) | **No filament** — filament is fully retracted into the buffer or not loaded | Normal buffer operation (existing logic) |
-| Closed (present) | Open (absent) | **Filament parked in gears** — filament tip is between the two switches, captured by the extruder gears | **Stop motor** — unload is complete, filament is parked and ready for next load |
-| Closed (present) | Closed (present) | **Filament loaded** — filament extends through gears to hotend | Normal loaded state |
-| Open (absent) | Closed (present) | **Anomalous** — filament past gears but not triggering proximal switch | Error / should not happen in normal operation |
+| State | Proximal | Distal | Motor | DUANLIAO | Description |
+|-------|----------|--------|-------|----------|-------------|
+| **Empty** | Open | Open | Off | Absent | No filament in device |
+| **Primed** | Closed | Closed | Off | Absent | Filament captured in extruder gears, not at hotend |
+| **Loaded** | Closed | Closed | Hall sensors | Present | Filament at hotend, normal buffer operation |
+| PrimingForward | Closed | Open | Forward | Absent | Advancing filament into gears |
+| Retracting | — | — | Back | Absent | Pulling filament back from Loaded |
+| Repriming | — | — | Forward | Absent | Re-advancing filament after retraction |
+| Unloading | — | — | Back | Absent | Removing filament from Primed |
+| Halted | — | — | Off | Absent | Stopped (button halt, timeout, or deadman release) |
 
-### Key Behavior Change
+### Button Behavior
 
-During **unload**: when the distal switch transitions from closed to open while the proximal switch remains closed, the firmware **stops the motor**. The filament is now parked inside the extruder gears — retracted from the hotend but still mechanically captured. The `DUANLIAO` output signals filament-absent to the VZ330, completing the automated unload. On the next load cycle, feeding can begin immediately since the filament hasn't fully left the gears.
+| Button | In Stable State | During Transition | Held 2 Seconds |
+|--------|----------------|-------------------|----------------|
+| **Forward (KEY2)** | Empty→Primed, Primed→Loaded | Halt (stop motor) | Deadman: motor runs forward until released |
+| **Back (KEY1)** | Loaded→Primed, Primed→Empty | Halt (stop motor) | Deadman: motor runs backward until released |
+
+After deadman release, device enters Halted state. From Halted, forward/back buttons resume based on current switch positions.
+
+### Loading Sequence (Empty → Primed → Loaded)
+
+1. **Empty**: Motor off, waiting for filament
+2. User inserts filament → proximal triggers → motor auto-advances forward (**PrimingForward**)
+3. Filament passes through extruder gears → distal triggers → motor stops → **Primed**
+4. User presses **forward button** → **Loaded** (hall sensor buffer operation begins)
+5. Motor feeds filament through bowden tube to hotend
+6. Backpressure builds → buffer hall sensors control motor → normal printing operation
+
+### Unloading Sequence (Loaded → Primed)
+
+1. **Loaded**: Normal printing operation
+2. User presses **back button** → motor retracts (**Retracting**)
+3. Filament retracts past distal switch, then past proximal switch → proximal opens
+4. Motor stops immediately, then **reverses** forward (**Repriming**)
+5. Filament re-advances until distal triggers → motor stops → **Primed**
+6. DUANLIAO signals absent throughout — VZ330 knows filament is not at hotend
+
+### Full Removal (Primed → Empty)
+
+1. **Primed**: Filament in gears, motor off
+2. User presses **back button** → motor retracts (**Unloading**)
+3. Filament pulled past proximal switch → proximal opens → motor stops → **Empty**
+4. User pulls filament out
+
+### Re-loading After Unload (Primed → Loaded)
+
+1. **Primed**: Filament parked in gears
+2. User presses **forward button** → **Loaded** (hall sensor operation)
+3. Motor feeds filament to hotend automatically
+4. No manual re-insertion needed — filament never left the gears
 
 ### Wiring
 

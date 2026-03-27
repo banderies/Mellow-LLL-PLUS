@@ -4,23 +4,22 @@
   * @author  lijihu
   * @version V1.0.0
   * @date    2025/05/10
-  * @brief   实现缓冲器功能
-			  *缓冲器说明
-				光感：遮挡1，不遮挡0；
-				耗材开关：有耗材0，无耗材1；
-				按键：按下0，松开1；
-
-				引脚：
-				HALL1 --> PB2 (光感3)
-				HALL2 --> PB3 (光感2)
-				HALL3 --> PB4 (光感1)
-				ENDSTOP_3 --> PB7(耗材开关)
-				KEY1 --> PB13(后退)	
-				KEY2 --> PB12(前进)
+  * @brief   Buffer board functionality
+  *          Hall sensor: blocked=1, unblocked=0
+  *          Filament switch: filament present=0, absent=1
+  *          Button: pressed=0, released=1
   *
-  * @note    
+  *          Pin mapping:
+  *          HALL1 --> PB2 (hall sensor 3)
+  *          HALL2 --> PB3 (hall sensor 2)
+  *          HALL3 --> PB4 (hall sensor 1)
+  *          ENDSTOP_3 --> PB7 (filament switch)
+  *          KEY1 --> PB13 (reverse)
+  *          KEY2 --> PB12 (forward)
+  *
+  * @note
   ***************************************************************************************
-  * 版权声明 COPYRIGHT 2025 xxx@126.com
+  * COPYRIGHT 2025 xxx@126.com
   ***************************************************************************************
 **/
 
@@ -28,11 +27,11 @@
 #include "buffer.h"
 #define VERSION "1.1.5"
 
-//GPIO输入
+//GPIO input
 #define SIGNAL_COUNT_READ_DIR_IO()	(SIGNAL_COUNT_DIR_GPIO_Port -> IDR & SIGNAL_COUNT_DIR_Pin)
-//TIM输入
+//TIM input
 #define SIGNAL_COUNT_READ_COUNT()		(SIGNAL_COUNT_Get_TIM -> CNT)
-//TIM输出
+//TIM output
 #define SIGNAL_COUNT_UP()						(SIGNAL_COUNT_Get_TIM -> CR1 &= ~(TIM_CR1_DIR))
 #define SIGNAL_COUNT_DOWN()					(SIGNAL_COUNT_Get_TIM -> CR1 |=  (TIM_CR1_DIR))
 
@@ -40,49 +39,72 @@
 
 
 TMC2209Stepper driver(UART, UART, R_SENSE, DRIVER_ADDRESS);
-Buffer buffer={0};//存储个传感器状态
+Buffer buffer={0};//stores sensor states
 Motor_State motor_state=Stop;
 static Motor_State last_motor_state=Stop;
 
-bool is_front=false;//前进标志位
-uint32_t front_time=0;//前进时间
+bool is_front=false;//forward movement flag
+uint32_t front_time=0;//forward feed time
 const uint32_t DEFAULT_TIMEOUT = 60000;
-uint32_t timeout=60000;//超时时间，单位：ms;
-bool is_error=false;//错误标志位，如果连续60s推送耗材没停过，则认为错误
+uint32_t timeout=60000;//timeout in ms
+bool is_error=false;//error flag, set if feeding continuously for 60s without stopping
 String serial_buf;
 
-static HardwareTimer timer(TIM6);//超时出错
-TIM_HandleTypeDef htim2;//硬件定时器接收脉冲
+static HardwareTimer timer(TIM6);//timeout error timer
+TIM_HandleTypeDef htim2;//hardware timer for pulse reception
 
 bool key1_press_flag=false;
 bool key2_press_flag=false;
-bool key1_release_flag=false;
-bool key2_release_flag=false;
 uint32_t key1_press_times=0;
 uint32_t key2_press_times=0;
-uint32_t key1_release_times=0;
-uint32_t key2_release_times=0;
-uint8_t key1_press_cnt=0;
-uint8_t key2_press_cnt=0;
 
-uint32_t inform_flag=false;
-uint32_t inform_times=0;
+// Device state machine
+typedef enum {
+	DS_Empty,            // No filament, motor off
+	DS_PrimingForward,   // Advancing filament to distal switch
+	DS_Primed,           // Both switches closed, motor off, filament in gears
+	DS_Loaded,           // Normal buffer operation (hall sensors)
+	DS_Retracting,       // Backing out from Loaded, waiting for proximal open
+	DS_Repriming,        // Re-advancing after retraction, waiting for distal trigger
+	DS_Unloading,        // Backing out from Primed to Empty
+	DS_Halted,           // Motor stopped, waiting for button input
+	DS_DeadmanForward,   // Override: motor forward while held
+	DS_DeadmanBack       // Override: motor backward while held
+} DeviceState;
+
+static DeviceState device_state = DS_Empty;
+
+static const char* state_name(DeviceState s) {
+	switch(s) {
+		case DS_Empty: return "Empty";
+		case DS_PrimingForward: return "PrimingForward";
+		case DS_Primed: return "Primed";
+		case DS_Loaded: return "Loaded";
+		case DS_Retracting: return "Retracting";
+		case DS_Repriming: return "Repriming";
+		case DS_Unloading: return "Unloading";
+		case DS_Halted: return "Halted";
+		case DS_DeadmanForward: return "DeadmanFwd";
+		case DS_DeadmanBack: return "DeadmanBack";
+		default: return "Unknown";
+	}
+}
 
 const uint32_t DEFAULT_STEPS = 916;
-uint32_t steps=916;//每毫米脉冲数;
-BlockageDetect blockage_detect={0};//堵料检测结构体
+uint32_t steps=916;//pulses per mm
+BlockageDetect blockage_detect={0};//blockage detection struct
 bool connet_mdm_flag=false;
 uint32_t blockage_inform_times=0;
 
 
 const float DEFAULT_ENCODER_LENGTH = 1.73;
-float encoder_length=1.73;//MDM段堵料模块每脉冲对应的线材移动量（mm/pulse）
+float encoder_length=1.73;//MDM module filament movement per pulse (mm/pulse)
 
 
 const float DEFAULT_ALLOW_ERROR_SCALE = 2;
-float allow_error_scale=2;//允许误差比例
+float allow_error_scale=2;//allowed error scale factor
 
-uint32_t I_CURRENT = 500;		//电流
+uint32_t I_CURRENT = 500;		//motor current (mA)
 
 const int EEPROM_ADDR_TIMEOUT = 0;
 const int EEPROM_ADDR_STEPS = 4;
@@ -94,32 +116,32 @@ const int EEPROM_ADDR_ENDSTOP_OUT = 24;
 
 
 
-//独立看门狗
+//independent watchdog (IWDG)
 #include "stm32f0xx_hal_iwdg.h"
 
 IWDG_HandleTypeDef hiwdg;
 static volatile uint32_t g_run_cnt=0;
-bool DUANLIAO_OUT_STATE = 0; //断料输出状 0
+bool DUANLIAO_OUT_STATE = 0; //filament runout output state
 Buffer_Parameter buffer_para;
 
 void iwdg_init(void)
 {
-	// 1. 使能写访问
-	IWDG->KR = 0x5555;     
+	// 1. Enable write access
+	IWDG->KR = 0x5555;
 
-	// 2. 设置分频
-	IWDG->PR = IWDG_PRESCALER_256;  
+	// 2. Set prescaler
+	IWDG->PR = IWDG_PRESCALER_256;
 
-	// 3. 设置重载值
-	IWDG->RLR = 125*10-1;  //超时时间2s
+	// 3. Set reload value
+	IWDG->RLR = 125*10-1;  //2s timeout
 
-	// 4. 启动 IWDG
-	IWDG->KR = 0xCCCC;     	
+	// 4. Start IWDG
+	IWDG->KR = 0xCCCC;
 }
 
 
 
-//函数声明
+//function declarations
 void key1_it_callback(void);
 void key2_it_callback(void);
 
@@ -153,17 +175,17 @@ void buffer_parameter_init(Buffer_Parameter &buffer_para){
 
 void buffer_init(){
 
-	NVIC_SetPriority(TIM6_DAC_IRQn,0);//超时出错，独立看门狗
-	// NVIC_SetPriority(TIM2_IRQn,1);//接收高频脉冲
-	NVIC_SetPriority(EXTI4_15_IRQn,1);//按键1 按键2 dir 断堵料脉冲
+	NVIC_SetPriority(TIM6_DAC_IRQn,0);//timeout error + watchdog
+	// NVIC_SetPriority(TIM2_IRQn,1);//high-frequency pulse reception
+	NVIC_SetPriority(EXTI4_15_IRQn,1);//KEY1, KEY2, dir, blockage pulses
 
 	if(Check_Connet_MDM()){
 		connet_mdm_flag=true;
-		Serial.println("有连接");
+		Serial.println("MDM connected");
 	}
 	else{
 		connet_mdm_flag=false;
-		Serial.println("无连接");
+		Serial.println("MDM not connected");
 		
 	}
 
@@ -174,12 +196,12 @@ void buffer_init(){
   Signal_Dir_Init();
   delay(1000);
 
-  VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715) ;  //VACTUAL寄存器值
+  VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715) ;  //VACTUAL register value
 
 
 
   timer.pause();
-  timer.setPrescaleFactor(4800);//4800分频  48000000/4800=10000
+  timer.setPrescaleFactor(4800);//4800 prescaler: 48000000/4800=10000Hz
   timer.setOverflow(1000);//100ms
   timer.attachInterrupt(&timer_it_callback);
   timer.resume();
@@ -189,19 +211,19 @@ void buffer_init(){
 
 void buffer_loop()
 {
-	uint32_t lastToggleTime = 0; // 记录上次切换的时间
+	uint32_t lastToggleTime = 0; // last toggle timestamp
 	
 	while (1)
 	{
 		uint32_t nowTime=millis();
 		if (blockage_detect.blockage_flag &&nowTime - lastToggleTime >= 50)
-		{							   // 堵料，爆闪
-			lastToggleTime = millis(); // 记录当前时间
+		{							   // blockage detected, rapid flash
+			lastToggleTime = millis();
 			digitalToggle(ERR_LED);
 			
 		}
 		else{
-			if(connet_mdm_flag){//连接了MDM模块，每秒闪两次
+			if(connet_mdm_flag){//MDM connected, blink twice per second
 				static uint8_t led_state=0;
 				if(led_state==0){
 					digitalWrite(ERR_LED,HIGH);
@@ -228,9 +250,9 @@ void buffer_loop()
 				}
 
 			}
-			else if(millis() - lastToggleTime >= 500) //没有连接，每秒闪一次
+			else if(millis() - lastToggleTime >= 500) //no MDM connection, blink once per second
 			{
-				lastToggleTime = millis(); // 记录当前时间
+				lastToggleTime = millis();
 				digitalToggle(ERR_LED);
 				// Serial.println("CNT:"+String(TIM2->CNT));
 				// Serial.println("	mdm_pulse_cnt:"+String(blockage_detect.mdm_pulse_cnt));
@@ -238,7 +260,7 @@ void buffer_loop()
 
 
 		}
-		// 1、读取各传感器的值
+		// 1. Read sensor values
 		read_sensor_state();
 		if(connet_mdm_flag) Blockage_Detect();
 		motor_control();
@@ -334,297 +356,400 @@ void read_sensor_state(void)
 	buffer.key2=digitalRead(KEY2);
 }
 
+// --- Motor command helpers ---
+
+static void cmd_motor_forward() {
+	WRITE_EN_PIN(0);
+	if(motor_state == Back) driver.VACTUAL(STOP);
+	driver.shaft(FORWARD);
+	driver.VACTUAL(VACTRUAL_VALUE);
+	motor_state = Forward;
+	last_motor_state = Forward;
+}
+
+static void cmd_motor_back() {
+	WRITE_EN_PIN(0);
+	if(motor_state == Forward) driver.VACTUAL(STOP);
+	driver.shaft(BACK);
+	driver.VACTUAL(VACTRUAL_VALUE);
+	motor_state = Back;
+	last_motor_state = Back;
+}
+
+static void cmd_motor_stop() {
+	driver.VACTUAL(STOP);
+	WRITE_EN_PIN(1);
+	motor_state = Stop;
+	last_motor_state = Stop;
+}
+
 /**
-  * @brief  电机控制
+  * @brief  Motor control state machine
+  *
+  * States: Empty → PrimingForward → Primed → Loaded → Retracting → Repriming → Primed
+  *
+  * Buttons (KEY1=back, KEY2=forward):
+  *   Short press: state transition (or halt if in transition)
+  *   Hold 2s: deadman switch (motor runs while held)
+  *
   * @param  NULL
   * @retval NULL
 **/
 void motor_control(void)
 {
-	static uint32_t cur_times=0;
-	cur_times=millis();
+	// Read switches: true = filament present
+	bool proximal = !digitalRead(ENDSTOP_3);
+	bool distal = !buffer.distal_switch_state;
 
-	//通知信号关闭
-	if(inform_flag&&cur_times-inform_times>=3000){
-		inform_flag=false;
-		digitalWrite(EXTENSION_PIN2,HIGH);
-		digitalWrite(EXTENSION_PIN1,LOW);
-	}
-	
-	//按键控制电机
-	//按键1短按后松开
-	if(key1_release_flag&&millis()-key1_release_times>500){
-
-		key1_release_flag=false;
-		//短按1次后松开
-		if(key1_press_cnt==1){
-			digitalWrite(EXTENSION_PIN2,LOW);
-			inform_times=millis();
-			inform_flag=true;
-			is_error=false;
+	// Determine initial state on first run
+	static bool first_run = true;
+	if(first_run) {
+		first_run = false;
+		if(proximal && distal) {
+			device_state = DS_Primed;
+		} else {
+			device_state = DS_Empty;
 		}
-		else if(key1_press_cnt>=2){//短按2次或两次以上后松开
-			is_error=true;
-		}
-
-		key1_press_cnt=0;
 	}
 
- 	//按键2短按后松开
-	if(key2_release_flag&&cur_times-key2_release_times>500){
+	// --- Button edge detection (press = falling edge, release = rising edge) ---
+	static bool key1_prev = false, key2_prev = false;
+	bool key1_held = key1_press_flag;
+	bool key2_held = key2_press_flag;
+	bool key1_just_pressed = key1_held && !key1_prev;
+	bool key2_just_pressed = key2_held && !key2_prev;
+	bool key1_just_released = !key1_held && key1_prev;
+	bool key2_just_released = !key2_held && key2_prev;
+	key1_prev = key1_held;
+	key2_prev = key2_held;
 
-		key2_release_flag=false;
-		//短按1次后松开
-		if(key2_press_cnt==1){
-			digitalWrite(EXTENSION_PIN1,HIGH);
-			inform_times=millis();
-			inform_flag=true;
-			is_error=false;
-		}
-		else if(key2_press_cnt>=2){//短按2次或两次以上后松开
-			is_error=true;
-		}
-		
-		key2_press_cnt=0;
+	// Track if a press was consumed during a transition (prevents release from triggering a new transition)
+	static bool key1_consumed = false, key2_consumed = false;
+	if(key1_just_released) key1_consumed = false;
+	if(key2_just_released) key2_consumed = false;
 
-	}	
-
-	//按键1按下后长按
-	if(key1_press_flag&&cur_times-key1_press_times>=500||digitalRead(BACK_SIGNAL_PIN)==LOW)
-	{
-		
-		WRITE_EN_PIN(0);//使能
-    	driver.VACTUAL(STOP);	//停止
-		
-    	driver.shaft(BACK);
-    	driver.VACTUAL(VACTRUAL_VALUE);
-		while(key1_press_flag||digitalRead(BACK_SIGNAL_PIN)==LOW){
-			delay(1);
-			g_run_cnt++;
-			// Serial.println("key1_press_flag is true ");
-		}//等待松手
-					
-
-		driver.VACTUAL(STOP);	//停止
-		motor_state=Stop;
-
-		is_front=false;
-		front_time=0;
-		is_error=false;
-		WRITE_EN_PIN(1);//失能
-		is_error=true;
-
+	// --- Deadman switch detection (2s hold) ---
+	if(device_state != DS_DeadmanBack && key1_held && millis() - key1_press_times >= 2000) {
+		cmd_motor_back();
+		is_front = false;
+		key1_consumed = true;
+		device_state = DS_DeadmanBack;
 	}
-	else if(key2_press_flag&&cur_times-key2_press_times>=500||digitalRead(FRONT_SIGNAL_PIN)==LOW)//按键2按下后长按
-	{
-
-		WRITE_EN_PIN(0);
-		driver.VACTUAL(STOP);	//停止
-		
-    	driver.shaft(FORWARD);
-		driver.VACTUAL(VACTRUAL_VALUE);
-		while(key2_press_flag||digitalRead(FRONT_SIGNAL_PIN)==LOW){
-			delay(1);
-			g_run_cnt++;
-		};//等待松手
-					
-
-		driver.VACTUAL(STOP);	//停止
-		motor_state=Stop;
-
-		is_front=false;
-		front_time=0;
-		is_error=false;
-		WRITE_EN_PIN(1);
-	}
-	
-	bool proximal_absent = digitalRead(ENDSTOP_3);        // HIGH = no filament at proximal (buffer side)
-	bool distal_absent = buffer.distal_switch_state;      // HIGH = no filament at distal (hotend side)
-
-	if(connet_mdm_flag){//连接了MDM断堵料模块
-		//判断耗材
-		if(proximal_absent&&!digitalRead(MDM_DPIN))
-		{
-			//无耗材，停止电机
-			driver.VACTUAL(STOP);	//停止
-			motor_state=Stop;
-
-			//断料引脚输出断料状态
-			digitalWrite(DUANLIAO,DUANLIAO_OUT_STATE);
-
-			//关闭指示灯
-			digitalWrite(START_LED,0);
-
-			is_front=false;
-			front_time=0;
-			is_error=false;
-			WRITE_EN_PIN(1);
-
-
-			return;//无耗材，结束
-		}
-		else if(!proximal_absent && distal_absent)
-		{
-			// Filament parked in extruder gears: proximal triggered but distal clear.
-			// Stop buffer motor — filament tip is captured in gears, ready for next load.
-			driver.VACTUAL(STOP);
-			motor_state=Stop;
-			last_motor_state=Stop;
-
-			// Signal filament absent to controller so automated unload completes
-			digitalWrite(DUANLIAO,DUANLIAO_OUT_STATE);
-
-			digitalWrite(START_LED,0);
-
-			is_front=false;
-			front_time=0;
-			is_error=false;
-			WRITE_EN_PIN(1);
-
-			return;
-		}
-		else if(!blockage_detect.blockage_flag){
-			//有耗材，断料引脚输出非断料状态
-			digitalWrite(DUANLIAO,!DUANLIAO_OUT_STATE);
-
-			//开启指示灯
-			digitalWrite(START_LED,1);
-
-		}
-
-	}
-	else{
-		//判断耗材
-		if(proximal_absent)
-		{
-			//无耗材，停止电机
-			driver.VACTUAL(STOP);	//停止
-			motor_state=Stop;
-
-			//断料引脚输出断料状态
-			digitalWrite(DUANLIAO,DUANLIAO_OUT_STATE);
-
-			//关闭指示灯
-			digitalWrite(START_LED,0);
-
-			is_front=false;
-			front_time=0;
-			is_error=false;
-			WRITE_EN_PIN(1);
-
-
-			return;//无耗材，结束
-		}
-
-		if(distal_absent)
-		{
-			// Filament parked in extruder gears: proximal triggered but distal clear.
-			// Stop buffer motor — filament tip is captured in gears, ready for next load.
-			driver.VACTUAL(STOP);
-			motor_state=Stop;
-			last_motor_state=Stop;
-
-			// Signal filament absent to controller so automated unload completes
-			digitalWrite(DUANLIAO,DUANLIAO_OUT_STATE);
-
-			digitalWrite(START_LED,0);
-
-			is_front=false;
-			front_time=0;
-			is_error=false;
-			WRITE_EN_PIN(1);
-
-			return;
-		}
-
-		//有耗材，断料引脚输出非断料状态
-		digitalWrite(DUANLIAO,!DUANLIAO_OUT_STATE);
-
-		//开启指示灯
-		digitalWrite(START_LED,1);
+	if(device_state != DS_DeadmanForward && key2_held && millis() - key2_press_times >= 2000) {
+		cmd_motor_forward();
+		is_front = false;
+		key2_consumed = true;
+		device_state = DS_DeadmanForward;
 	}
 
-		
-
-
-	//判断是否有错误
-	if(is_error){
-		//停止电机
-		driver.VACTUAL(STOP);	//停止
-		motor_state=Stop;
-		WRITE_EN_PIN(1);
-		return ;
-	}
-
-	//缓冲器位置记录
-	if(buffer.buffer1_pos1_sensor_state)	//缓冲器位置为1，耗材往前推
-	{
-		last_motor_state=motor_state;		//记录上一次状态
-		motor_state=Forward;
-		is_front=true;
-
-	}
-	else if(buffer.buffer1_pos2_sensor_state)	//缓冲器位置为2,电机停止转动
-	{
-		last_motor_state=motor_state;		//记录上一次状态
-		motor_state=Stop;
-		is_front=false;
-		front_time=0;
-	}
-	else if(buffer.buffer1_pos3_sensor_state)	//缓冲器位置为3，回退耗材
-	{
-		last_motor_state=motor_state;		//记录上一次状态
-		motor_state=Back;
-		is_front=false;
-		front_time=0;
-	}
-			
-	if(motor_state==last_motor_state)//如果上次状态跟这次状态一致，则不需要再次发送控制命令,结束此次函数
+	// Handle deadman release → Halted
+	if(device_state == DS_DeadmanBack && key1_just_released) {
+		cmd_motor_stop();
+		is_front = false;
+		front_time = 0;
+		device_state = DS_Halted;
 		return;
-	
-	static uint8_t write_cnt=0;
-	uint8_t retry_count=9;
-	
-	//电机控制
-	switch(motor_state)
-	{
-		case Forward://向前
-		{
-			WRITE_EN_PIN(0);
-			if(last_motor_state==Back)	driver.VACTUAL(STOP);//上次是后退，先停下再前进
-			driver.shaft(FORWARD);
-			write_cnt=driver.IFCNT();
-			driver.VACTUAL(VACTRUAL_VALUE);
-			while(write_cnt==driver.IFCNT()&&retry_count--){//发送失败重发
-				driver.VACTUAL(VACTRUAL_VALUE);
+	}
+	if(device_state == DS_DeadmanForward && key2_just_released) {
+		cmd_motor_stop();
+		is_front = false;
+		front_time = 0;
+		device_state = DS_Halted;
+		return;
+	}
+
+	// Deadman active: keep motor running, skip state machine
+	if(device_state == DS_DeadmanBack || device_state == DS_DeadmanForward) {
+		return;
+	}
+
+	// --- Button press events (on press, not release) ---
+	// Only fire if not already consumed (by halt or deadman)
+	bool back_press = key1_just_pressed && !key1_consumed;
+	bool fwd_press = key2_just_pressed && !key2_consumed;
+
+	// --- PB5/PB6 external signal control (blocking deadman) ---
+	if(digitalRead(BACK_SIGNAL_PIN) == LOW) {
+		cmd_motor_back();
+		while(digitalRead(BACK_SIGNAL_PIN) == LOW) { delay(1); g_run_cnt++; }
+		cmd_motor_stop();
+		is_front = false;
+		front_time = 0;
+		device_state = DS_Halted;
+		return;
+	}
+	if(digitalRead(FRONT_SIGNAL_PIN) == LOW) {
+		cmd_motor_forward();
+		while(digitalRead(FRONT_SIGNAL_PIN) == LOW) { delay(1); g_run_cnt++; }
+		cmd_motor_stop();
+		is_front = false;
+		front_time = 0;
+		device_state = DS_Halted;
+		return;
+	}
+
+	// --- Timeout check ---
+	if(is_error) {
+		cmd_motor_stop();
+		is_front = false;
+		front_time = 0;
+		is_error = false;
+		device_state = DS_Halted;
+		return;
+	}
+
+	// --- State machine ---
+	switch(device_state) {
+
+		case DS_Empty:
+			if(motor_state != Stop) cmd_motor_stop();
+			is_front = false;
+			front_time = 0;
+			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
+			digitalWrite(START_LED, 0);
+
+			// Auto-advance when filament inserted (proximal triggers)
+			if(proximal && !distal) {
+				cmd_motor_forward();
+				front_time = 0;
+				device_state = DS_PrimingForward;
+			} else if(proximal && distal) {
+				// Both already closed (edge case)
+				device_state = DS_Primed;
+			}
+			break;
+
+		case DS_PrimingForward:
+			is_front = true; // Timeout safety
+			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
+			digitalWrite(START_LED, 0);
+
+			// Any button during transition = halt
+			if(fwd_press || back_press) {
+				cmd_motor_stop();
+				is_front = false;
+				if(fwd_press) key2_consumed = true;
+				if(back_press) key1_consumed = true;
+				device_state = DS_Halted;
+				break;
 			}
 
-		}break;
-		case Stop://停止
-		{
-			write_cnt=driver.IFCNT();
-			driver.VACTUAL(STOP);
-			while(write_cnt==driver.IFCNT()&&retry_count--){//发送失败重发
-				driver.VACTUAL(STOP);
-			}	
-			WRITE_EN_PIN(1);		
+			// Target: distal triggered → Primed
+			if(distal) {
+				cmd_motor_stop();
+				is_front = false;
+				device_state = DS_Primed;
+			}
+			// Filament removed during priming
+			if(!proximal && !distal) {
+				cmd_motor_stop();
+				is_front = false;
+				device_state = DS_Empty;
+			}
+			break;
 
-		}break;
-		case Back://向后
-		{
-			WRITE_EN_PIN(0);
-			if(last_motor_state==Forward)	driver.VACTUAL(STOP);;//上次是前进，先停下再后退
-			driver.shaft(BACK);
-			write_cnt=driver.IFCNT();
-			driver.VACTUAL(VACTRUAL_VALUE);
-			while(write_cnt==driver.IFCNT()&&retry_count--){//发送失败重发
-				driver.VACTUAL(VACTRUAL_VALUE);
-			}				
-		}break;
-		
+		case DS_Primed:
+			if(motor_state != Stop) cmd_motor_stop();
+			is_front = false;
+			front_time = 0;
+			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
+			digitalWrite(START_LED, 0);
+
+			if(fwd_press) {
+				device_state = DS_Loaded; // Enter buffer operation
+			}
+			if(back_press) {
+				cmd_motor_back();
+				device_state = DS_Unloading;
+			}
+			break;
+
+		case DS_Loaded: {
+			// Normal buffer operation (stock hall sensor logic)
+			digitalWrite(DUANLIAO, !DUANLIAO_OUT_STATE);
+			digitalWrite(START_LED, 1);
+
+			// Back button → start retracting
+			if(back_press) {
+				cmd_motor_back();
+				is_front = false;
+				front_time = 0;
+				device_state = DS_Retracting;
+				break;
+			}
+
+			// Filament runout during printing
+			if(!proximal) {
+				cmd_motor_stop();
+				is_front = false;
+				front_time = 0;
+				digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
+				digitalWrite(START_LED, 0);
+				device_state = DS_Empty;
+				break;
+			}
+
+			// Hall sensor buffer position logic
+			Motor_State new_state = motor_state;
+			if(buffer.buffer1_pos1_sensor_state) {
+				new_state = Forward;
+				is_front = true;
+			} else if(buffer.buffer1_pos2_sensor_state) {
+				new_state = Stop;
+				is_front = false;
+				front_time = 0;
+			} else if(buffer.buffer1_pos3_sensor_state) {
+				new_state = Back;
+				is_front = false;
+				front_time = 0;
+			}
+
+			if(new_state != motor_state) {
+				uint8_t write_cnt = 0;
+				uint8_t retry_count = 9;
+
+				switch(new_state) {
+					case Forward:
+						WRITE_EN_PIN(0);
+						if(motor_state == Back) driver.VACTUAL(STOP);
+						driver.shaft(FORWARD);
+						write_cnt = driver.IFCNT();
+						driver.VACTUAL(VACTRUAL_VALUE);
+						while(write_cnt == driver.IFCNT() && retry_count--) {
+							driver.VACTUAL(VACTRUAL_VALUE);
+						}
+						break;
+					case Stop:
+						write_cnt = driver.IFCNT();
+						driver.VACTUAL(STOP);
+						while(write_cnt == driver.IFCNT() && retry_count--) {
+							driver.VACTUAL(STOP);
+						}
+						WRITE_EN_PIN(1);
+						break;
+					case Back:
+						WRITE_EN_PIN(0);
+						if(motor_state == Forward) driver.VACTUAL(STOP);
+						driver.shaft(BACK);
+						write_cnt = driver.IFCNT();
+						driver.VACTUAL(VACTRUAL_VALUE);
+						while(write_cnt == driver.IFCNT() && retry_count--) {
+							driver.VACTUAL(VACTRUAL_VALUE);
+						}
+						break;
+				}
+				motor_state = new_state;
+				last_motor_state = new_state;
+			}
+			break;
+		}
+
+		case DS_Retracting:
+			is_front = false;
+			front_time = 0;
+			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
+			digitalWrite(START_LED, 0);
+
+			// Any button during transition = halt
+			if(fwd_press || back_press) {
+				cmd_motor_stop();
+				if(fwd_press) key2_consumed = true;
+				if(back_press) key1_consumed = true;
+				device_state = DS_Halted;
+				break;
+			}
+
+			// Distal opened → filament pulled back past gears
+			// Stop, then reverse to re-prime (push filament back until distal triggers)
+			if(!distal) {
+				cmd_motor_stop();
+				delay(50); // Brief pause before reversing
+				cmd_motor_forward();
+				front_time = 0;
+				device_state = DS_Repriming;
+			}
+			break;
+
+		case DS_Repriming:
+			is_front = true; // Timeout safety
+			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
+			digitalWrite(START_LED, 0);
+
+			// Any button during transition = halt
+			if(fwd_press || back_press) {
+				cmd_motor_stop();
+				is_front = false;
+				if(fwd_press) key2_consumed = true;
+				if(back_press) key1_consumed = true;
+				device_state = DS_Halted;
+				break;
+			}
+
+			// Target: distal triggered → Primed
+			if(distal) {
+				cmd_motor_stop();
+				is_front = false;
+				device_state = DS_Primed;
+			}
+			break;
+
+		case DS_Unloading:
+			is_front = false;
+			front_time = 0;
+			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
+			digitalWrite(START_LED, 0);
+
+			// Any button during transition = halt
+			if(fwd_press || back_press) {
+				cmd_motor_stop();
+				if(fwd_press) key2_consumed = true;
+				if(back_press) key1_consumed = true;
+				device_state = DS_Halted;
+				break;
+			}
+
+			// Proximal opened → filament removed → Empty
+			if(!proximal) {
+				cmd_motor_stop();
+				device_state = DS_Empty;
+			}
+			break;
+
+		case DS_Halted:
+			if(motor_state != Stop) cmd_motor_stop();
+			is_front = false;
+			front_time = 0;
+			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
+			digitalWrite(START_LED, 0);
+
+			if(fwd_press) {
+				if(proximal && !distal) {
+					cmd_motor_forward();
+					front_time = 0;
+					device_state = DS_PrimingForward;
+				} else if(proximal && distal) {
+					device_state = DS_Loaded;
+				} else {
+					device_state = DS_Empty;
+				}
+			}
+			if(back_press) {
+				if(proximal && distal) {
+					cmd_motor_back();
+					device_state = DS_Retracting;
+				} else if(proximal && !distal) {
+					cmd_motor_back();
+					device_state = DS_Unloading;
+				} else {
+					device_state = DS_Empty;
+				}
+			}
+			break;
+
+		default:
+			device_state = DS_Empty;
+			break;
 	}
-	last_motor_state=motor_state;		//记录上一次状态
-	
 }
 
 void timer_it_callback(){
@@ -668,44 +793,23 @@ void timer_it_callback(){
 }
 
 void key1_it_callback(void){
-	if(!digitalRead(KEY1)){//下降沿
+	if(!digitalRead(KEY1)){  // Falling edge (press)
 		key1_press_times=millis();
-		key1_press_cnt++;
 		key1_press_flag=true;
 	}
-	else{//上升沿
-		if(millis()-key1_press_times<=500){
-			key1_release_flag=true;
-			key1_release_times=millis();
-		}
-		else{
-			key1_release_flag=false;
-			key1_press_cnt=0;
-
-		}
+	else{  // Rising edge (release)
 		key1_press_flag=false;
 	}
 }
 
-
 void key2_it_callback(void){
-	if(!digitalRead(KEY2)){//下降沿
+	if(!digitalRead(KEY2)){  // Falling edge (press)
 		key2_press_times=millis();
-		key2_press_cnt++;
 		key2_press_flag=true;
 	}
-	else{//上升沿
-		if(millis()-key2_press_times<=500){
-			key2_release_flag=true;
-			key2_release_times=millis();
-
-		}
-		else{
-			key2_release_flag=false;
-			key2_press_cnt=0;
-		}
+	else{  // Rising edge (release)
 		key2_press_flag=false;
-	}	
+	}
 }
 
 void Recv_MDM_Pulse_IT_Callback(void){
@@ -874,6 +978,8 @@ void USB_Serial_Analys(void){
 				Serial.println("allow_error_scale="+String(allow_error_scale));
 				Serial.println("allow_error="+String(blockage_detect.allow_error));
 				Serial.println("DUANLIAO_OUT_STATE="+String(buffer_para.DUANLIAO_OUT_STATE));
+				Serial.print("device_state=");
+				Serial.println(state_name(device_state));
 				Serial.print("proximal_switch(PB7)=");
 				Serial.println(digitalRead(ENDSTOP_3) ? "OPEN (no filament)" : "CLOSED (filament present)");
 				Serial.print("distal_switch(PB14)=");
@@ -917,7 +1023,7 @@ void USB_Serial_Analys(void){
 				}
 				buffer_para.SPEED=num;
 				SPEED=num;
-				VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715) ;  //VACTUAL寄存器值
+				VACTRUAL_VALUE=(uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715) ;  //VACTUAL register value
 				EEPROM.put(0, buffer_para);
 				serial_buf="";
 				Serial.print("set speed  succeed! speed=");

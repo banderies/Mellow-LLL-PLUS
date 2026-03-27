@@ -20,8 +20,10 @@ This repo is a fork of `Fly3DTeam/Buffer` (the official Mellow firmware).
 To check for upstream changes: `git fetch upstream && git log HEAD..upstream/dev-1.1.x --oneline`
 
 ### Custom Modifications (vs upstream)
-- **Distal filament switch** on PB14: detects filament parked in extruder gears during unload
-- See `docs/STATUS.md` for full pin analysis and behavior documentation
+- **Distal filament switch** on PB14: detects filament captured in extruder gears
+- **State machine rewrite**: 3 primary states (Empty/Primed/Loaded) with button-driven transitions
+- **Button behavior**: short press = state transition or halt; 2s hold = deadman override
+- See `docs/STATUS.md` for full pin analysis, state table, and sequence documentation
 
 ## Build System
 
@@ -133,14 +135,20 @@ The firmware uses multiple interrupt sources with specific priorities (set in `b
 - Priority 1: EXTI4_15 (buttons, direction signal, MDM pulses)
 
 ### State Machine Flow
-1. Read all sensor states (including distal switch on PB14)
-2. Check filament presence via proximal + distal switches:
-   - Both absent → no filament, stop motor, signal DUANLIAO
-   - Proximal present + distal absent → filament parked in gears, stop motor, signal DUANLIAO
-   - Both present → filament loaded, continue to buffer position logic
-3. Determine motor action based on buffer position (hall sensors)
-4. Check for timeout/error conditions
-5. Update motor state only when changed (prevents redundant UART traffic)
+The firmware uses an explicit state machine (`DeviceState` enum in `buffer.cpp`):
+1. Read switches + detect button edges (short press vs 2s deadman hold)
+2. Handle deadman override (motor runs in direction while held, ignores all other logic)
+3. Handle PB5/PB6 external signal control (blocking deadman)
+4. Check timeout (`is_error` from timer ISR) → transition to Halted
+5. Execute state-specific logic:
+   - **Empty**: auto-advance when proximal triggers (→ PrimingForward)
+   - **PrimingForward**: advance until distal triggers (→ Primed)
+   - **Primed**: wait for button. Forward → Loaded, Back → Unloading
+   - **Loaded**: stock hall sensor buffer logic. Back → Retracting
+   - **Retracting**: back until proximal opens, then auto-reverse (→ Repriming)
+   - **Repriming**: forward until distal triggers (→ Primed)
+   - **Unloading**: back until proximal opens (→ Empty)
+   - **Halted**: wait for button, determine next state from switch positions
 6. Process serial commands
 
 ### TMC2209 Communication
