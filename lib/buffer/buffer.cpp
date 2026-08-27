@@ -45,9 +45,9 @@ static Motor_State last_motor_state=Stop;
 
 bool is_front=false;//forward movement flag
 uint32_t front_time=0;//forward feed time
-const uint32_t DEFAULT_TIMEOUT = 60000;
-uint32_t timeout=60000;//timeout in ms
-bool is_error=false;//error flag, set if feeding continuously for 60s without stopping
+const uint32_t DEFAULT_TIMEOUT = 120000;
+uint32_t timeout=120000;//timeout in ms
+bool is_error=false;//error flag, set if feeding continuously for `timeout` ms without stopping
 
 static HardwareTimer timer(TIM6);//timeout error timer
 TIM_HandleTypeDef htim2;//hardware timer for pulse reception
@@ -436,8 +436,10 @@ void motor_control(void)
 				// Unknown state, buffer not retracted — probe to determine
 				device_state = DS_StartupProbe;
 			}
-		} else if(proximal && !distal) {
-			device_state = DS_Halted; // Don't auto-advance on startup
+		} else if(proximal || distal) {
+			// Filament present but not fully seated (or spool tail still in gears
+			// after a runout). Don't auto-advance on startup — let the user decide.
+			device_state = DS_Halted;
 		} else {
 			device_state = DS_Empty;
 		}
@@ -487,7 +489,12 @@ void motor_control(void)
 
 	// --- Global sensor validation (runs FIRST, before timeout) ---
 	// If both switches open, force to Empty regardless of state.
-	// Catches edge cases where rapid filament removal leaves device in inconsistent state.
+	// This is the ONLY condition that makes the device non-functional: filament is
+	// nowhere in the path and not gripped by the gears. Proximal open with distal
+	// still closed means the spool ran out and the tail is still in the gears —
+	// every state keeps operating normally so the remaining filament can be fed
+	// through to the printer (and a new spool can be hot-refilled behind it).
+	// Also catches edge cases where rapid filament removal leaves device inconsistent.
 	if(!proximal && !distal &&
 	   device_state != DS_Empty) {
 		cmd_motor_stop(); // Always force stop (EN pin HIGH), even if motor_state thinks it's stopped
@@ -547,6 +554,11 @@ void motor_control(void)
 			} else if(proximal && distal) {
 				// Both already closed (edge case)
 				device_state = DS_Primed;
+			} else if(!proximal && distal) {
+				// Spool tail still in the gears (e.g. printer retraction pulled it
+				// back over the distal switch). Filament is present, so the device
+				// is functional — go to Halted and let the user pick a direction.
+				device_state = DS_Halted;
 			}
 			break;
 
@@ -596,10 +608,9 @@ void motor_control(void)
 
 			// Sensor validation: react to switch changes
 			// (skip distal check briefly after entering to avoid switch bounce)
-			if(!proximal) {
-				device_state = DS_Empty;
-				break;
-			}
+			// Note: proximal open with distal closed = spool tail still in the gears.
+			// Stay Primed (fwd → Loaded feeds the tail through; both open → Empty via
+			// the global check).
 			if(!distal && millis() - state_entry_time >= 50) {
 				cmd_motor_forward();
 				front_time = 0;
@@ -620,7 +631,11 @@ void motor_control(void)
 		case DS_Loaded: {
 			// === BUFFER ACTIVE ===
 			// Motor is 100% driven by hall sensors (matches upstream logic).
-			// Only exits: back button press, proximal opens (filament runout), or forward timeout.
+			// Only exits: back button press, forward timeout, or both switches open
+			// (global check). Spool runout (proximal opens, distal still closed) does
+			// NOT stop the buffer: the tail is still gripped by the gears and must be
+			// fed through so the printer can use the remaining filament. The buffer
+			// keeps cycling until the tail clears the distal switch → Empty.
 			digitalWrite(DUANLIAO, !DUANLIAO_OUT_STATE);
 			digitalWrite(START_LED, 1);
 
@@ -631,15 +646,6 @@ void motor_control(void)
 				front_time = 0;
 				transition_start = millis();
 				device_state = DS_Retracting;
-				break;
-			}
-
-			// Filament runout (proximal opened) → emergency stop
-			if(!proximal) {
-				cmd_motor_stop();
-				is_front = false;
-				front_time = 0;
-				device_state = DS_Empty;
 				break;
 			}
 
@@ -710,8 +716,8 @@ void motor_control(void)
 			digitalWrite(DUANLIAO, DUANLIAO_OUT_STATE);
 			digitalWrite(START_LED, 0);
 
-			// Sensor validation: filament yanked out (either or both switches open)
-			if(!proximal) {
+			// Sensor validation: filament yanked out (both switches open)
+			if(!proximal && !distal) {
 				cmd_motor_stop();
 				is_front = false;
 				device_state = DS_Empty;
@@ -766,8 +772,10 @@ void motor_control(void)
 				break;
 			}
 
-			// Proximal opened → filament removed → Empty
-			if(!proximal) {
+			// Both switches open → filament removed → Empty
+			// (backing out opens distal first, then proximal, so this fires when
+			// proximal opens in the normal case)
+			if(!proximal && !distal) {
 				cmd_motor_stop();
 				device_state = DS_Empty;
 			}
@@ -823,8 +831,8 @@ void motor_control(void)
 				break;
 			}
 
-			// Proximal opened → filament fully removed
-			if(!proximal) {
+			// Both switches open → filament fully removed
+			if(!proximal && !distal) {
 				cmd_motor_stop();
 				device_state = DS_Empty;
 				break;
@@ -846,22 +854,24 @@ void motor_control(void)
 				break;
 			}
 
+			// Next state from switch positions. Distal closed = filament in the
+			// gears (proximal may be open if the spool tail has passed it).
 			if(fwd_press) {
 				if(proximal && !distal) {
 					cmd_motor_forward();
 					front_time = 0;
 					transition_start = millis();
 					device_state = DS_PrimingForward;
-				} else if(proximal && distal) {
+				} else if(distal) {
 					device_state = DS_Loaded;
 				} else {
 					device_state = DS_Empty;
 				}
 			} else if(back_press) {
-				if(proximal && distal) {
+				if(distal) {
 					cmd_motor_back();
 					device_state = DS_Retracting;
-				} else if(proximal && !distal) {
+				} else if(proximal) {
 					cmd_motor_back();
 					transition_start = millis();
 					device_state = DS_Unloading;

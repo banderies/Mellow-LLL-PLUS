@@ -106,14 +106,16 @@ The firmware implements a state machine with three primary states and several tr
 | State | Proximal | Distal | Motor | DUANLIAO | Description |
 |-------|----------|--------|-------|----------|-------------|
 | **Empty** | Open | Open | Off | Absent | No filament in device |
-| **Primed** | Closed | Closed | Off | Absent | Filament captured in extruder gears, not at hotend |
-| **Loaded** | Closed | Closed | Hall sensors | Present | Filament at hotend, normal buffer operation |
+| **Primed** | Closed* | Closed | Off | Absent | Filament captured in extruder gears, not at hotend |
+| **Loaded** | Closed* | Closed | Hall sensors | Present | Filament at hotend, normal buffer operation |
 | PrimingForward | Closed | Open | Forward | Absent | Advancing filament into gears (5s timeout) |
 | Retracting | Closed | Closed→Open | Back | Absent | Pulling filament back from Loaded (no timeout) |
 | Repriming | Closed | Open→Closed | Forward | Absent | Re-advancing filament after retraction (5s timeout) |
 | Unloading | Closed→Open | — | Back | Absent | Removing filament from Primed (5s timeout) |
 | Halted | — | — | Off | Absent | Stopped (button halt, timeout, or error) |
 | StartupProbe | Closed | Closed | Back | Absent | Boot-time retraction to determine Primed vs Loaded (10s timeout) |
+
+\* **Runout rule:** the device only becomes non-functional (**Empty**) when *both* switches are open. Proximal open with distal still closed means the spool has run out and the tail is still gripped by the extruder gears — Primed and Loaded keep operating normally so the remaining filament can be fed through (and a fresh spool can be hot-refilled behind it). See *Spool Runout* below.
 
 ### Button Behavior
 
@@ -155,6 +157,16 @@ After deadman release, the pre-deadman state is restored if sensors are consiste
 2. User presses **forward button** → **Loaded** (hall sensor operation)
 3. Motor feeds filament to hotend automatically
 4. No manual re-insertion needed — filament never left the gears
+
+### Spool Runout (Loaded → Empty)
+
+1. **Loaded**: Normal printing operation
+2. Spool runs out → tail passes proximal switch → proximal opens, distal still closed
+3. **Buffer keeps running** — hall sensors continue to drive the motor, DUANLIAO still signals present. The tail is still gripped by the gears, so the printer can consume the remaining filament. Inserting a new spool at this point (hot refill) re-closes proximal; the new filament follows the tail through the gears.
+4. Tail clears the extruder gears → distal opens → both switches open → motor stops → **Empty**
+5. DUANLIAO signals absent → Klipper runout / PAUSE. Filament between the buffer's distal switch and the hotend is no longer under buffer control.
+
+If the tail drifts back over the distal switch (e.g. a printer retraction), or the device boots with proximal open / distal closed, it goes to **Halted**: forward → Loaded (feed the tail through), back → Retracting.
 
 ### Wiring
 

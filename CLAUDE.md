@@ -96,7 +96,7 @@ If connected, adds blockage detection by comparing:
 
 ### Safety Features
 - Independent watchdog timer (IWDG) with 2s timeout
-- Timeout detection for continuous feeding (default 60s)
+- Timeout detection for continuous feeding (default 120s)
 - Blockage detection with configurable error tolerance
 - EEPROM storage for persistent configuration
 
@@ -105,7 +105,7 @@ If connected, adds blockage detection by comparing:
 Connect via USB serial at 115200 baud:
 
 ```
-timeout <ms>         # Set forward feed timeout (default 60000ms)
+timeout <ms>         # Set forward feed timeout (default 120000ms)
 rt                   # Read current timeout value
 steps <value>        # Set steps per mm (default 916)
 encoder <value>      # Set MDM encoder length in mm/pulse (default 1.73)
@@ -149,17 +149,17 @@ The firmware uses an explicit state machine (`DeviceState` enum in `buffer.cpp`)
 1. Read switches + detect button edges (short press vs 2s deadman hold)
 2. Handle deadman override (saves pre-deadman state; motor runs in direction while held; restores original state on release unless sensors contradict)
 3. Handle PB5/PB6 external signal control (blocking deadman)
-4. Global sensor validation: both switches open → force to Empty
+4. Global sensor validation: both switches open → force to Empty. This is the *only* non-functional condition — proximal open with distal closed means a spool tail is still gripped by the gears (runout) and every state keeps operating normally
 5. Check timeout (`is_error` from timer ISR) → transition to Halted (active in forward states + Loaded)
 6. Execute state-specific logic:
    - **Empty**: auto-advance when proximal triggers (→ PrimingForward)
    - **PrimingForward**: advance until distal triggers (→ Primed), 5s timeout
    - **Primed**: wait for button. Forward → Loaded, Back → Unloading. Distal open → re-prime (500ms debounce)
-   - **Loaded**: hall sensor buffer logic (upstream behavior: no-sensor = continue direction). Uses coast stop. Forward timeout active. Back → Retracting
+   - **Loaded**: hall sensor buffer logic (upstream behavior: no-sensor = continue direction). Uses coast stop. Forward timeout active. Back → Retracting. Spool runout (proximal opens) does NOT stop the buffer — it keeps feeding until the tail clears the distal switch → Empty
    - **Retracting**: motor runs back until distal opens, then auto-reverse (→ Repriming). No timeout.
    - **Repriming**: forward until distal triggers (→ Primed), 5s timeout
    - **Unloading**: back until proximal opens (→ Empty), 5s timeout
-   - **Halted**: wait for button, determine next state from switch positions
+   - **Halted**: wait for button, determine next state from switch positions (distal closed = filament in gears: Forward → Loaded, Back → Retracting, regardless of proximal)
    - **StartupProbe**: retract on boot to determine Primed vs Loaded (10s timeout)
 7. Persist state to EEPROM on Primed/Loaded entry
 8. Process serial commands
